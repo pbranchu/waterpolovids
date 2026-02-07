@@ -1,8 +1,158 @@
 """CLI entry point for the wpv pipeline."""
 
+from pathlib import Path
+
 import typer
 
 app = typer.Typer(name="wpv", help="Water Polo Video auto-reframe pipeline.")
+
+
+@app.command()
+def detect(video_path: Path = typer.Argument(..., help="Path to a video file")):
+    """Detect video format and print info."""
+    from wpv.ingest.detect_format import detect_format
+
+    info = detect_format(video_path)
+    typer.echo(f"Format:   {info.format.value}")
+    typer.echo(f"Size:     {info.width}x{info.height}")
+    typer.echo(f"FPS:      {info.fps}")
+    typer.echo(f"Duration: {info.duration:.2f}s")
+    typer.echo(f"Codec:    {info.codec}")
+    typer.echo(f"LRV:      {info.lrv_path or 'not found'}")
+
+
+@app.command()
+def decode(
+    video_path: Path = typer.Argument(..., help="Path to a video file"),
+    out_dir: Path = typer.Option(..., "-o", "--out-dir", help="Output work directory"),
+):
+    """Prepare equirectangular video (symlink/stitch/copy)."""
+    from wpv.ingest.detect_format import detect_format
+    from wpv.ingest.stitch import prepare_equirect
+
+    info = detect_format(video_path)
+    result = prepare_equirect(info, out_dir)
+    typer.echo(f"[decode] {info.format.value} → {result}")
+
+
+@app.command()
+def manifest(
+    video_dir: Path = typer.Argument(..., help="Directory containing PRO_VID_*.mp4 files"),
+    out_path: Path = typer.Option(None, "-o", "--out", help="Output manifest.json path"),
+    teams: str = typer.Option("unknown", help="Team names"),
+    location: str = typer.Option("unknown", help="Pool / venue location"),
+):
+    """Generate manifest.json from video directory."""
+    from wpv.ingest.manifest import generate_manifest
+
+    m = generate_manifest(video_dir, teams=teams, location=location)
+    json_str = m.model_dump_json(indent=2)
+
+    if out_path:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json_str)
+        typer.echo(f"[manifest] Written to {out_path}")
+    else:
+        typer.echo(json_str)
+
+
+@app.command()
+def detect_ball(
+    video_path: Path = typer.Argument(..., help="Path to a video file (LRV or MP4)"),
+    output: Path = typer.Option("detections.json", "-o", "--output", help="Output JSON path"),
+    visualize: bool = typer.Option(False, "--visualize", help="Draw bounding boxes on frames"),
+    vis_output: Path = typer.Option(None, "--vis-output", help="Annotated video output path"),
+):
+    """Run ball detection (HSV + CNN) on a video."""
+    from wpv.config import settings
+    from wpv.tracking.detector import BallDetector
+
+    detector = BallDetector(
+        min_area=settings.min_ball_px,
+        max_area=settings.max_ball_px,
+        confidence_threshold=settings.detection_confidence_threshold,
+    )
+    detections = detector.process_video(
+        video_path,
+        output_path=output,
+        visualize=visualize,
+        vis_output=vis_output,
+    )
+    total = sum(len(d) for d in detections)
+    typer.echo(f"[detect-ball] {len(detections)} frames, {total} total detections → {output}")
+
+
+@app.command()
+def label_frames(
+    video_path: Path = typer.Argument(..., help="Path to a video file"),
+    count: int = typer.Option(100, "--count", help="Number of frames to extract"),
+    output: Path = typer.Option("frames/", "-o", "--output", help="Output directory"),
+    strategy: str = typer.Option("uniform", "--strategy", help="uniform, random, or diverse"),
+):
+    """Extract frames from a video for labeling."""
+    from scripts.label_frames import extract_frames, generate_annotations_stub
+
+    frames = extract_frames(video_path, output, count, strategy)
+    ann_path = output / "annotations.json"
+    generate_annotations_stub(frames, ann_path)
+    typer.echo(f"[label-frames] Extracted {len(frames)} frames → {output}")
+
+
+@app.command()
+def label(
+    prep_only: bool = typer.Option(False, "--prep-only", help="Only extract frames and run HSV detection"),
+    serve_only: bool = typer.Option(False, "--serve-only", help="Only launch the labeling web UI"),
+    batch: bool = typer.Option(False, "--batch", help="Run iterative batch labeling workflow"),
+    train: bool = typer.Option(False, "--train", help="Tune HSV params and train CNN from annotations"),
+    schedule: str = typer.Option(
+        "50,50,50,50,50,50", "--schedule",
+        help="Comma-separated batch sizes for --batch mode",
+    ),
+    count: int = typer.Option(500, "--count", help="Target number of frames to extract"),
+    port: int = typer.Option(5001, "--port", help="HTTP port for the labeling UI"),
+    force: bool = typer.Option(False, "--force", help="Overwrite existing annotations"),
+):
+    """Label ball candidates for CNN training data.
+
+    Two-step workflow: prep extracts frames + HSV candidates, serve launches the labeling UI.
+    By default runs both steps (prep then serve).
+
+    Use --batch for iterative batch labeling with automatic retraining.
+    Use --train to tune HSV params and train CNN from existing annotations.
+    """
+    import argparse
+    import importlib.util
+    import sys
+
+    # Import from scripts/ which isn't a package — use importlib
+    spec = importlib.util.spec_from_file_location(
+        "label_ball",
+        Path(__file__).resolve().parents[2] / "scripts" / "label_ball.py",
+    )
+    label_ball = importlib.util.module_from_spec(spec)
+    sys.modules["label_ball"] = label_ball
+    spec.loader.exec_module(label_ball)
+
+    if train:
+        train_args = argparse.Namespace()
+        label_ball.cmd_train(train_args)
+        return
+
+    if batch:
+        batch_args = argparse.Namespace(schedule=schedule, port=port)
+        label_ball.cmd_batch(batch_args)
+        return
+
+    run_prep = not serve_only
+    run_serve = not prep_only
+
+    if run_prep:
+        prep_args = argparse.Namespace(count=count, force=force)
+        label_ball.cmd_prep(prep_args)
+
+    if run_serve:
+        serve_args = argparse.Namespace(port=port)
+        label_ball.cmd_serve(serve_args)
 
 
 @app.command()

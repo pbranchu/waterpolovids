@@ -23,7 +23,7 @@ dependencies = [
 
 [project.optional-dependencies]
 upscale = ["realesrgan", "basicsr"]
-dev = ["pytest>=7.0", "ruff>=0.1"]
+dev = ["pytest>=7.0", "ruff>=0.1", "flask>=3.0"]
 
 [project.scripts]
 wpv = "wpv.cli:app"

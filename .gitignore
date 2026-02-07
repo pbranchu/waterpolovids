@@ -20,6 +20,7 @@ env/
 
 # Data and models
 data/
+data/labeling/
 vendor/
 src/wpv/tracking/models/*.pt
 src/wpv/tracking/models/*.pth
