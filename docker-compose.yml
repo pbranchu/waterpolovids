@@ -1,0 +1,21 @@
+services:
+  wpv:
+    build: .
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+    volumes:
+      - /mnt/work/shared/Waterpolo:/data/raw:ro
+      - wpv-work:/data/work
+      - wpv-output:/data/output
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+volumes:
+  wpv-work:
+  wpv-output:
