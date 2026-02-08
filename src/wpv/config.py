@@ -26,7 +26,11 @@ class Settings(BaseSettings):
     detection_confidence_threshold: float = 0.6
 
     # Tracking state machine
-    track_loss_frames: int = 22  # ~0.75s at 30fps
+    track_loss_frames: int = 19  # ~0.75s at 25fps
+    track_detection_scale: float = 0.5
+    track_search_window_frames: int = 125  # 5s at 25fps (search_forward_step)
+    track_reacquire_persistence: int = 5
+    track_gate_distance: float = 5.0
     search_forward_step_s: float = 5.0
     search_max_gap_s: float = 45.0
     rewind_coarse_step_s: float = 0.25

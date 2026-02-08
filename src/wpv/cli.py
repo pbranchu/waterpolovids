@@ -170,10 +170,118 @@ def stitch(match_id: str = typer.Argument(..., help="Match identifier")):
 
 
 @app.command()
-def track(match_id: str = typer.Argument(..., help="Match identifier")):
-    """Run ball detection and tracking on the equirectangular master."""
-    typer.echo(f"[track] {match_id} — not yet implemented")
-    raise typer.Exit(1)
+def track(
+    video_path: Path = typer.Argument(..., help="Path to a video file"),
+    output: Path = typer.Option("track.json", "-o", "--output", help="Output JSON path"),
+    clip: str = typer.Option(None, "--clip", help="Clip name (defaults to filename stem)"),
+    scale: float = typer.Option(None, "--scale", help="Detection scale (default from config)"),
+    ref_image: Path = typer.Option(None, "--ref-image", help="Ball reference image for scoring"),
+    model: Path = typer.Option(None, "--model", help="CNN model path"),
+):
+    """Track ball through a video clip and save track JSON."""
+    from wpv.config import settings
+    from wpv.tracking.detector import BallDetector
+    from wpv.tracking.track_io import save_track
+    from wpv.tracking.tracker import BallTracker
+
+    det_scale = scale if scale is not None else settings.track_detection_scale
+
+    detector = BallDetector(
+        model_path=str(model) if model else None,
+        ref_image_path=str(ref_image) if ref_image else None,
+        min_area=settings.min_ball_px,
+        max_area=settings.max_ball_px,
+        confidence_threshold=settings.detection_confidence_threshold,
+    )
+    tracker = BallTracker(
+        detector=detector,
+        detection_scale=det_scale,
+        loss_frames=settings.track_loss_frames,
+        search_step_s=settings.search_forward_step_s,
+        search_max_gap_s=settings.search_max_gap_s,
+        rewind_step_s=settings.rewind_coarse_step_s,
+        reacquire_persistence=settings.track_reacquire_persistence,
+        gate_distance=settings.track_gate_distance,
+        confidence_threshold=settings.detection_confidence_threshold,
+    )
+
+    def _progress(frame: int, total: int, state: str) -> None:
+        typer.echo(f"  [track] {frame}/{total} ({state})")
+
+    result = tracker.track_clip(
+        video_path, clip_name=clip, progress_callback=_progress,
+    )
+    save_track(result, output)
+    typer.echo(
+        f"[track] {result.clip_name}: {result.stats.get('num_points', 0)} points, "
+        f"{result.stats.get('num_gaps', 0)} gaps, {result.elapsed_s:.1f}s → {output}"
+    )
+
+
+@app.command()
+def track_all(
+    video_dir: Path = typer.Argument(
+        ..., help="Directory containing PRO_VID_*.mp4 files"
+    ),
+    out_dir: Path = typer.Option(
+        "data/tracks", "-o", "--out-dir", help="Output directory for track JSONs"
+    ),
+    scale: float = typer.Option(None, "--scale", help="Detection scale (default from config)"),
+    ref_image: Path = typer.Option(None, "--ref-image", help="Ball reference image for scoring"),
+    model: Path = typer.Option(None, "--model", help="CNN model path"),
+):
+    """Track ball in all video clips found in a directory."""
+    from wpv.config import settings
+    from wpv.tracking.detector import BallDetector
+    from wpv.tracking.track_io import save_track
+    from wpv.tracking.tracker import BallTracker
+
+    det_scale = scale if scale is not None else settings.track_detection_scale
+
+    videos = sorted(video_dir.glob("*.mp4"))
+    if not videos:
+        typer.echo(f"[track-all] No .mp4 files found in {video_dir}")
+        raise typer.Exit(1)
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    detector = BallDetector(
+        model_path=str(model) if model else None,
+        ref_image_path=str(ref_image) if ref_image else None,
+        min_area=settings.min_ball_px,
+        max_area=settings.max_ball_px,
+        confidence_threshold=settings.detection_confidence_threshold,
+    )
+    tracker = BallTracker(
+        detector=detector,
+        detection_scale=det_scale,
+        loss_frames=settings.track_loss_frames,
+        search_step_s=settings.search_forward_step_s,
+        search_max_gap_s=settings.search_max_gap_s,
+        rewind_step_s=settings.rewind_coarse_step_s,
+        reacquire_persistence=settings.track_reacquire_persistence,
+        gate_distance=settings.track_gate_distance,
+        confidence_threshold=settings.detection_confidence_threshold,
+    )
+
+    for i, vp in enumerate(videos, 1):
+        clip_name = vp.stem
+        out_path = out_dir / f"{clip_name}.json"
+        typer.echo(f"[track-all] ({i}/{len(videos)}) {clip_name}")
+
+        def _progress(frame: int, total: int, state: str) -> None:
+            typer.echo(f"  [track] {frame}/{total} ({state})")
+
+        result = tracker.track_clip(
+            vp, clip_name=clip_name, progress_callback=_progress,
+        )
+        save_track(result, out_path)
+        typer.echo(
+            f"  → {result.stats.get('num_points', 0)} points, "
+            f"{result.stats.get('num_gaps', 0)} gaps, {result.elapsed_s:.1f}s"
+        )
+
+    typer.echo(f"[track-all] Done. {len(videos)} clips → {out_dir}")
 
 
 @app.command()

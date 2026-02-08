@@ -25,6 +25,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from wpv.tracking.video_reader import _nv12_to_bgr_bt709
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -67,33 +69,6 @@ def _load_annotations() -> dict:
     if ann_data.get("version", 1) >= 2:
         ANNOTATIONS_PATH.write_text(json.dumps(ann_data, indent=2))
     return ann_data.get("frames", {})
-
-def _nv12_to_bgr_bt709(nv12: np.ndarray, height: int) -> np.ndarray:
-    """Convert NV12 buffer to BGR using BT.709 coefficients.
-
-    OpenCV's COLOR_YUV2BGR_NV12 uses BT.601 which is wrong for HD/4K H.265
-    content. BT.709 is the correct standard for HD video.
-    """
-    # NV12 layout: Y plane (height rows), UV plane (height/2 rows, interleaved U,V)
-    y_plane = nv12[:height, :].astype(np.float32)
-    uv_plane = nv12[height:, :]
-    width = y_plane.shape[1]
-
-    # Separate U and V (interleaved in NV12)
-    u = uv_plane[:, 0::2].astype(np.float32) - 128.0
-    v = uv_plane[:, 1::2].astype(np.float32) - 128.0
-
-    # Upsample UV to full resolution (nearest neighbor, same as hardware)
-    u = np.repeat(np.repeat(u, 2, axis=0), 2, axis=1)[:height, :width]
-    v = np.repeat(np.repeat(v, 2, axis=0), 2, axis=1)[:height, :width]
-
-    # BT.709 YUV → RGB
-    r = y_plane + 1.5748 * v
-    g = y_plane - 0.1873 * u - 0.4681 * v
-    b = y_plane + 1.8556 * u
-
-    bgr = np.stack([b, g, r], axis=-1)
-    return np.clip(bgr, 0, 255).astype(np.uint8)
 
 
 def _nvdec_read_frames(
