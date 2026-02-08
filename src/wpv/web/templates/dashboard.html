@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block title %}WPV — Dashboard{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <h1>Games</h1>
+  <a href="/game/new" class="btn btn-primary">New Game</a>
+</div>
+
+{% if games %}
+<table class="table">
+  <thead>
+    <tr>
+      <th>Name</th>
+      <th>Created</th>
+      <th>Status</th>
+      <th>Progress</th>
+      <th>Actions</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for g in games %}
+    <tr data-game-id="{{ g.game_id }}" data-status="{{ g.status }}">
+      <td>{{ g.name }}</td>
+      <td>{{ g.created_at[:16] }}</td>
+      <td>
+        <span class="badge badge-{{ g.status }}">{{ g.status }}</span>
+        {% if g.error_message and g.status == 'failed' %}
+        <span class="error-hint" title="{{ g.error_message }}">!</span>
+        {% endif %}
+      </td>
+      <td>
+        <div class="progress-bar-sm">
+          <div class="progress-fill-sm" style="width:{{ g.progress_pct }}%"></div>
+        </div>
+        <span class="progress-pct">{{ "%.0f"|format(g.progress_pct) }}%</span>
+      </td>
+      <td class="actions">
+        {% if g.status == 'setup' %}
+        <a href="/game/{{ g.game_id }}/upload" class="btn btn-sm">Upload</a>
+        <a href="/game/{{ g.game_id }}/masks" class="btn btn-sm">Masks</a>
+        <a href="/game/{{ g.game_id }}/review" class="btn btn-sm btn-accent">Review</a>
+        {% elif g.status in ('processing', 'queued') %}
+        <span class="text-muted">Processing...</span>
+        {% elif g.status == 'completed' %}
+        <span class="text-success">Done</span>
+        {% elif g.status == 'failed' %}
+        <a href="/game/{{ g.game_id }}/review" class="btn btn-sm">Retry</a>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<div class="empty-state">
+  <p>No games yet. Create one to get started.</p>
+  <a href="/game/new" class="btn btn-primary">New Game</a>
+</div>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='dashboard.js') }}"></script>
+{% endblock %}

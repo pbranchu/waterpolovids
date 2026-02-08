@@ -40,19 +40,61 @@ class Settings(BaseSettings):
     default_hfov_deg: float = 70.0
     zoom_hfov_deg: float = 45.0
 
-    # Render
+    # Render (equirect reframe — future)
     output_width: int = 1920
     output_height: int = 1080
     output_codec: str = "libx264"
     output_crf: int = 18
     output_fps: float = 30.0
 
+    # Render (single-lens crop/pan)
+    crop_output_width: int = 1280
+    crop_output_height: int = 720
+    crop_output_codec: str = "libx264"
+    crop_output_crf: int = 20
+    crop_output_preset: str = "medium"
+    crop_smoothing_alpha: float = 0.08
+    crop_dead_zone_px: int = 20
+    crop_max_velocity_px: float = 120.0
+
+    # Fisheye lens intrinsics (Insta360 X5 single-lens)
+    fisheye_focal_length_px: float = 1466.0   # f = 2304 / (pi/2)
+    fisheye_center_x: float = 2304.0
+    fisheye_center_y: float = 2304.0
+    fisheye_undistort: bool = True
+
     # Highlights
     highlight_min_duration_s: float = 3.0
     highlight_max_duration_s: float = 480.0  # 8 min
+    highlight_target_duration_s: float = 300.0
+    highlight_score_threshold: float = 0.4
+    highlight_context_s: float = 3.0
+    highlight_crossfade_s: float = 0.5
+    highlight_speed_sigma: float = 2.0
+    highlight_direction_window_s: float = 0.5
+    highlight_gap_reappear_bonus: float = 0.3
+    highlight_max_segments: int = 50
+
+    # Quality gates
+    quality_min_track_coverage_pct: float = 60.0
+    quality_min_highlight_duration_s: float = 180.0
 
     # YouTube
     youtube_client_secrets: Path = Path("client_secrets.json")
+    youtube_token_path: Path = Path("~/.wpv/youtube_token.json")
+    youtube_default_privacy: str = "unlisted"
+    youtube_category_id: str = "17"
+
+    # Game masks & shared output
+    game_masks_path: Path = Path("data/labeling/game_masks.json")
+    shared_output_dir: Path = Path("/mnt/work/shared")
+
+    # Results DB
+    results_db_path: Path = Path("~/.wpv/results.db")
+
+    # Web UI
+    web_upload_chunk_size_mb: int = 10
+    web_port: int = 5000
 
 
 settings = Settings()

@@ -1,0 +1,84 @@
+{% extends "base.html" %}
+{% block title %}WPV — Mask Editor: Clip {{ clip_num }}/{{ total_clips }}{% endblock %}
+
+{% block head %}
+<style>
+  main.container { padding: 0; max-width: 100%; }
+  .mask-layout { display: flex; flex-direction: column; height: calc(100vh - 48px); }
+  .mask-header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 8px 16px; background: #16213e; flex-shrink: 0;
+  }
+  .mask-header h2 { font-size: 15px; font-weight: 500; margin: 0; }
+  .mask-progress { display: flex; align-items: center; gap: 12px; }
+  .progress-bar-mask { width: 200px; height: 6px; background: #333; border-radius: 3px; overflow: hidden; }
+  .progress-fill-mask { height: 100%; background: #0f3460; border-radius: 3px; }
+  .canvas-area { flex: 1; display: flex; align-items: center; justify-content: center;
+                  position: relative; overflow: hidden; cursor: crosshair; }
+  #mask-canvas { display: block; }
+  #zoom-inset {
+    position: absolute; width: 200px; height: 200px;
+    border: 2px solid #e94560; border-radius: 4px;
+    pointer-events: none; display: none;
+    image-rendering: pixelated; overflow: hidden;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+  }
+  #zoom-canvas { image-rendering: pixelated; }
+  .mask-controls {
+    display: flex; gap: 8px; padding: 8px 16px; justify-content: center;
+    background: #16213e; flex-shrink: 0; flex-wrap: wrap; align-items: center;
+  }
+  .mask-controls label { font-size: 13px; color: #ccc; display: flex; align-items: center; gap: 4px; }
+  .mask-info { font-size: 12px; color: #888; text-align: center; padding: 4px; flex-shrink: 0; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="mask-layout">
+  <div class="mask-header">
+    <h2>Mask: Clip {{ clip_num }}/{{ total_clips }} &mdash; {{ game.name }}</h2>
+    <div class="mask-progress">
+      <a href="/game/{{ game.game_id }}/upload" class="btn btn-sm">Upload</a>
+      <div class="progress-bar-mask">
+        <div class="progress-fill-mask" style="width:{{ progress_pct }}%"></div>
+      </div>
+      <span style="font-size:13px;color:#aaa;">{{ clip_num }}/{{ total_clips }}</span>
+      <a href="/game/{{ game.game_id }}/review" class="btn btn-sm btn-accent">Review</a>
+    </div>
+  </div>
+
+  <div class="canvas-area" id="canvas-area">
+    <canvas id="mask-canvas"></canvas>
+    <div id="zoom-inset"><canvas id="zoom-canvas" width="200" height="200"></canvas></div>
+  </div>
+
+  <div class="mask-controls">
+    <button class="btn btn-sm" onclick="navClip(-1)" id="prev-clip">&larr; Prev</button>
+    <button class="btn btn-sm" onclick="undoPoint()"><kbd>Z</kbd> Undo</button>
+    <button class="btn btn-sm" onclick="clearPoly()"><kbd>C</kbd> Clear</button>
+    <button class="btn btn-sm" id="cone-btn" onclick="toggleCones()"><kbd>H</kbd> Cones</button>
+    <label>
+      <input type="checkbox" id="apply-all" checked> Apply to all clips
+    </label>
+    <button class="btn btn-sm btn-save" onclick="saveMask()"><kbd>Enter</kbd> Save & Next</button>
+    <button class="btn btn-sm" onclick="navClip(1)" id="next-clip">Next &rarr;</button>
+  </div>
+
+  <div class="mask-info" id="mask-info">Click to place polygon vertices marking the pool boundary. Need >= 3 points.</div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+window.MASK_CONFIG = {
+  gameId: '{{ game.game_id }}',
+  clipIdx: {{ clip_idx }},
+  totalClips: {{ total_clips }},
+  existingPoly: {{ existing_poly_json|safe }},
+  frameUrl: '/api/game/{{ game.game_id }}/frame/{{ clip_idx }}',
+  conesUrl: '/api/game/{{ game.game_id }}/cones/{{ clip_idx }}',
+  saveUrl: '/api/game/{{ game.game_id }}/mask'
+};
+</script>
+<script src="{{ url_for('static', filename='mask-editor.js') }}"></script>
+{% endblock %}

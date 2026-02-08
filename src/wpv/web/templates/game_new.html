@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block title %}WPV — New Game{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <h1>New Game</h1>
+</div>
+
+<form action="/game/create" method="post" class="form-card">
+  <div class="form-group">
+    <label for="name">Game Name</label>
+    <input type="text" id="name" name="name" placeholder="e.g. Sharks vs Dolphins - Jan 15"
+           required autofocus class="form-input">
+  </div>
+  <div class="form-group">
+    <label for="clip_count">Number of Clips</label>
+    <input type="number" id="clip_count" name="clip_count" value="4" min="1" max="20"
+           class="form-input form-input-sm">
+    <span class="form-hint">How many video files make up this game</span>
+  </div>
+  <div class="form-actions">
+    <a href="/" class="btn">Cancel</a>
+    <button type="submit" class="btn btn-primary">Create Game</button>
+  </div>
+</form>
+{% endblock %}

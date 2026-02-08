@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}WPV{% endblock %}</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+{% block head %}{% endblock %}
+</head>
+<body>
+<nav class="navbar">
+  <a href="/" class="nav-brand">WPV</a>
+  <div class="nav-links">
+    <a href="/">Dashboard</a>
+    <a href="/game/new">New Game</a>
+  </div>
+</nav>
+
+<main class="container">
+  {% block content %}{% endblock %}
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script>
+function showToast(msg, duration) {
+  var t = document.getElementById('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  setTimeout(function() { t.classList.remove('show'); }, duration || 2000);
+}
+</script>
+{% block scripts %}{% endblock %}
+</body>
+</html>

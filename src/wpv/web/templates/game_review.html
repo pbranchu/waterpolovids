@@ -1,0 +1,71 @@
+{% extends "base.html" %}
+{% block title %}WPV — Review: {{ game.name }}{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <h1>Review: {{ game.name }}</h1>
+</div>
+
+<div class="review-grid">
+  {% for cm in clip_masks %}
+  <div class="review-card">
+    <h3>Clip {{ cm.clip.clip_index + 1 }}</h3>
+    <div class="review-thumb">
+      {% if cm.clip.frame_path %}
+      <img src="/api/game/{{ game.game_id }}/frame/{{ cm.clip.clip_index }}" alt="Clip {{ cm.clip.clip_index + 1 }}">
+      {% else %}
+      <div class="no-frame">No frame</div>
+      {% endif %}
+    </div>
+    <div class="review-details">
+      <span class="filename">{{ cm.clip.filename or 'Not uploaded' }}</span>
+      {% if cm.mask %}
+      <span class="badge badge-completed">Mask set ({{ cm.mask|length }} pts)</span>
+      {% else %}
+      <span class="badge badge-setup">No mask</span>
+      {% endif %}
+    </div>
+    <div class="review-actions">
+      <a href="/game/{{ game.game_id }}/masks/{{ cm.clip.clip_index }}" class="btn btn-sm">Edit Mask</a>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+
+<form action="/game/{{ game.game_id }}/process" method="post" class="form-card" style="margin-top:24px;">
+  <h2>Processing Options</h2>
+  <div class="form-group">
+    <label for="playlist_name">YouTube Playlist (optional)</label>
+    <input type="text" id="playlist_name" name="playlist_name"
+           value="{{ game.playlist_name or '' }}"
+           placeholder="e.g. Water Polo 2025 Season" class="form-input">
+    <span class="form-hint">Leave blank to skip YouTube upload. Playlist will be created if it doesn't exist.</span>
+    <div id="playlist-suggestions"></div>
+  </div>
+  <div class="form-actions">
+    <a href="/" class="btn">Back to Dashboard</a>
+    <button type="submit" class="btn btn-primary" id="process-btn">Start Processing</button>
+  </div>
+</form>
+{% endblock %}
+
+{% block scripts %}
+<script>
+// Load playlist suggestions
+fetch('/api/playlists')
+  .then(function(r) { return r.json(); })
+  .then(function(data) {
+    if (data.ok && data.playlists.length > 0) {
+      var el = document.getElementById('playlist-suggestions');
+      var html = '<div class="playlist-list"><span class="text-muted">Existing:</span> ';
+      data.playlists.forEach(function(p) {
+        html += '<button type="button" class="btn btn-sm" onclick="document.getElementById(\'playlist_name\').value=\'' +
+                p.title.replace(/'/g, "\\'") + '\'">' + p.title + '</button> ';
+      });
+      html += '</div>';
+      el.innerHTML = html;
+    }
+  })
+  .catch(function() {});
+</script>
+{% endblock %}

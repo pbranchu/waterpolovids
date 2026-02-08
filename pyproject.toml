@@ -19,11 +19,12 @@ dependencies = [
     "scikit-image>=0.21",
     "google-api-python-client>=2.90",
     "google-auth-oauthlib>=1.0",
+    "flask>=3.0",
 ]
 
 [project.optional-dependencies]
 upscale = ["realesrgan", "basicsr"]
-dev = ["pytest>=7.0", "ruff>=0.1", "flask>=3.0"]
+dev = ["pytest>=7.0", "ruff>=0.1"]
 
 [project.scripts]
 wpv = "wpv.cli:app"

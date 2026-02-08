@@ -292,17 +292,177 @@ def camera(match_id: str = typer.Argument(..., help="Match identifier")):
 
 
 @app.command()
-def render(match_id: str = typer.Argument(..., help="Match identifier")):
-    """Render reframed video from equirectangular master + camera path."""
-    typer.echo(f"[render] {match_id} — not yet implemented")
-    raise typer.Exit(1)
+def render(
+    video_path: Path = typer.Argument(..., help="Path to source video file"),
+    track_path: Path = typer.Argument(..., help="Path to track JSON from `wpv track`"),
+    output: Path = typer.Option("output.mp4", "-o", "--output", help="Output video path"),
+    preview: bool = typer.Option(False, "--preview", help="Fast preview (half-res, crf 28)"),
+    width: int = typer.Option(None, "--width", help="Crop width (default from config)"),
+    height: int = typer.Option(None, "--height", help="Crop height (default from config)"),
+    crf: int = typer.Option(None, "--crf", help="Output CRF (default from config)"),
+    game_masks: Path = typer.Option(
+        None, "--game-masks", help="Path to game_masks.json with manual pool boundaries"
+    ),
+    clip_name: str = typer.Option(
+        None, "--clip-name", help="Clip key in game_masks.json, e.g. clip_000"
+    ),
+    start_frame: int = typer.Option(0, "--start-frame", help="First frame to render (0-based)"),
+    end_frame: int = typer.Option(0, "--end-frame", help="Last frame to render (0 = end of clip)"),
+    no_undistort: bool = typer.Option(False, "--no-undistort", help="Disable fisheye undistortion"),
+    hfov: float = typer.Option(None, "--hfov", help="Output horizontal FOV in degrees (default 70)"),
+):
+    """Render crop-and-pan video following tracked ball positions."""
+    from wpv.config import settings
+    from wpv.render.reframe import CropRenderer, load_game_mask_bounds
+    from wpv.tracking.track_io import load_track
+
+    track = load_track(track_path)
+    crop_w = width if width is not None else settings.crop_output_width
+    crop_h = height if height is not None else settings.crop_output_height
+    out_crf = crf if crf is not None else settings.crop_output_crf
+
+    # Load pool bounds from manual mask or fall back to auto-detection
+    pool_bounds = None
+    if game_masks and clip_name:
+        pool_bounds = load_game_mask_bounds(game_masks, clip_name)
+        typer.echo(
+            f"[render] Pool bounds from {clip_name}: "
+            f"x=[{pool_bounds.x_min}, {pool_bounds.x_max}] "
+            f"y=[{pool_bounds.y_min}, {pool_bounds.y_max}]"
+        )
+
+    def _progress(done: int, total: int) -> None:
+        if done % 250 == 0 or done == total:
+            typer.echo(f"  [render] {done}/{total} frames")
+
+    undistort = not no_undistort and settings.fisheye_undistort
+    out_hfov = hfov if hfov is not None else settings.default_hfov_deg
+
+    renderer = CropRenderer(
+        video_path=video_path,
+        track=track,
+        output_path=output,
+        crop_w=crop_w,
+        crop_h=crop_h,
+        alpha=settings.crop_smoothing_alpha,
+        dead_zone=settings.crop_dead_zone_px,
+        max_vel=settings.crop_max_velocity_px,
+        codec=settings.crop_output_codec,
+        crf=out_crf,
+        preset=settings.crop_output_preset,
+        preview=preview,
+        progress_callback=_progress,
+        pool_bounds=pool_bounds,
+        start_frame=start_frame,
+        end_frame=end_frame,
+        undistort=undistort,
+        hfov_deg=out_hfov,
+    )
+    result = renderer.run()
+    typer.echo(f"[render] Done → {result}")
 
 
 @app.command()
-def highlights(match_id: str = typer.Argument(..., help="Match identifier")):
-    """Extract highlight montage."""
-    typer.echo(f"[highlights] {match_id} — not yet implemented")
-    raise typer.Exit(1)
+def highlights(
+    track_path: Path = typer.Argument(..., help="Path to track JSON from `wpv track`"),
+    output: Path = typer.Option("segments.json", "-o", "--output", help="Output segments JSON (or .mp4 with --render)"),
+    render_video: Path = typer.Option(None, "--render", help="Source video to render montage from"),
+    target_duration: float = typer.Option(None, "--target-duration", help="Target highlight duration (s)"),
+    threshold: float = typer.Option(None, "--threshold", help="Score threshold for highlights"),
+    crossfade: float = typer.Option(None, "--crossfade", help="Crossfade duration between segments (s)"),
+    preview: bool = typer.Option(False, "--preview", help="Fast preview (lower quality)"),
+):
+    """Score track data and extract highlight segments (+ optional montage render)."""
+    from wpv.config import settings
+    from wpv.render.highlights import (
+        build_montage,
+        save_segments,
+        score_track,
+        select_segments,
+    )
+    from wpv.tracking.track_io import load_track
+
+    track = load_track(track_path)
+
+    tgt_dur = target_duration if target_duration is not None else settings.highlight_target_duration_s
+    thr = threshold if threshold is not None else settings.highlight_score_threshold
+    xfade = crossfade if crossfade is not None else settings.highlight_crossfade_s
+
+    scores = score_track(
+        track,
+        speed_sigma_threshold=settings.highlight_speed_sigma,
+        direction_window_s=settings.highlight_direction_window_s,
+        gap_reappear_bonus=settings.highlight_gap_reappear_bonus,
+    )
+    segments = select_segments(
+        scores,
+        fps=track.fps,
+        threshold=thr,
+        context_s=settings.highlight_context_s,
+        min_segment_s=settings.highlight_min_duration_s,
+        target_duration_s=tgt_dur,
+        max_segments=settings.highlight_max_segments,
+    )
+
+    total_dur = sum(s.end_s - s.start_s for s in segments)
+    typer.echo(f"[highlights] {len(segments)} segments, {total_dur:.1f}s total")
+
+    if render_video is not None:
+        crf = 28 if preview else settings.crop_output_crf
+        preset = "ultrafast" if preview else settings.crop_output_preset
+        montage_out = output if str(output).endswith(".mp4") else output.with_suffix(".mp4")
+        build_montage(
+            segments,
+            source_video=render_video,
+            output_path=montage_out,
+            fps=track.fps,
+            crossfade_s=xfade,
+            codec=settings.crop_output_codec,
+            crf=crf,
+            preset=preset,
+        )
+        typer.echo(f"[highlights] Montage → {montage_out}")
+    else:
+        save_segments(segments, output)
+        typer.echo(f"[highlights] Segments → {output}")
+
+
+@app.command()
+def quality_check(
+    track_path: Path = typer.Argument(..., help="Path to track JSON from `wpv track`"),
+    segments_path: Path = typer.Option(None, "--segments", help="Path to segments JSON from `wpv highlights`"),
+    strict: bool = typer.Option(False, "--strict", help="Exit code 1 on gate failure"),
+    min_coverage: float = typer.Option(None, "--min-coverage", help="Min track coverage %"),
+    min_hl_duration: float = typer.Option(None, "--min-hl-duration", help="Min highlight duration (s)"),
+):
+    """Run pre-publish quality gates on track (and optional highlight) data."""
+    from wpv.config import settings
+    from wpv.quality import run_quality_gates
+    from wpv.render.highlights import load_segments
+    from wpv.tracking.track_io import load_track
+
+    track = load_track(track_path)
+
+    segments = None
+    if segments_path is not None:
+        segments = load_segments(segments_path)
+
+    cov = min_coverage if min_coverage is not None else settings.quality_min_track_coverage_pct
+    hl_dur = min_hl_duration if min_hl_duration is not None else settings.quality_min_highlight_duration_s
+
+    report = run_quality_gates(
+        track,
+        segments=segments,
+        min_track_coverage_pct=cov,
+        min_highlight_duration_s=hl_dur,
+    )
+
+    typer.echo(f"Track coverage:     {report.track_coverage_pct:.1f}%  {'PASS' if report.track_coverage_ok else 'FAIL'}")
+    typer.echo(f"Highlight duration: {report.highlight_duration_s:.1f}s  {'PASS' if report.highlight_duration_ok else 'FAIL'}")
+    typer.echo(f"Overall:            {'PASS' if report.passed else 'FAIL'}")
+
+    if strict and not report.passed:
+        raise typer.Exit(1)
 
 
 @app.command()
@@ -313,17 +473,171 @@ def upscale(match_id: str = typer.Argument(..., help="Match identifier")):
 
 
 @app.command()
-def publish(match_id: str = typer.Argument(..., help="Match identifier")):
-    """Upload to YouTube."""
-    typer.echo(f"[publish] {match_id} — not yet implemented")
-    raise typer.Exit(1)
+def process(
+    match_dir: Path = typer.Argument(..., help="Directory containing match video files"),
+    skip_upload: bool = typer.Option(False, "--skip-upload", help="Skip YouTube upload"),
+    stages: str = typer.Option(None, "--stages", help="Comma-separated stages to run (detect,decode,track,render,highlights,quality-check,upload)"),
+):
+    """Run the full pipeline on a single match directory."""
+    from wpv.pipeline import Stage, run_pipeline
+
+    active_stages = None
+    if stages:
+        active_stages = [Stage(s.strip()) for s in stages.split(",")]
+
+    def _progress(stage: Stage, msg: str) -> None:
+        typer.echo(f"  [{stage.value}] {msg}")
+
+    result = run_pipeline(
+        match_dir,
+        stages=active_stages,
+        skip_upload=skip_upload,
+        progress_callback=_progress,
+    )
+
+    if result.success:
+        typer.echo(f"[process] {result.match_id} completed successfully")
+        if result.youtube_url:
+            typer.echo(f"  YouTube: {result.youtube_url}")
+    else:
+        failed = [s for s in result.stages if not s.success and not s.skipped]
+        if failed:
+            typer.echo(f"[process] {result.match_id} failed at {failed[0].stage.value}: {failed[0].error}")
+        raise typer.Exit(1)
 
 
 @app.command()
-def run_all(match_id: str = typer.Argument(..., help="Match identifier")):
-    """Run the full pipeline end-to-end."""
-    typer.echo(f"[run-all] {match_id} — not yet implemented")
-    raise typer.Exit(1)
+def batch(
+    input_dir: Path = typer.Argument(..., help="Directory containing match subdirectories"),
+    resume: bool = typer.Option(False, "--resume", help="Skip already-completed matches"),
+    parallel: int = typer.Option(1, "--parallel", help="Number of parallel workers"),
+    skip_upload: bool = typer.Option(False, "--skip-upload", help="Skip YouTube upload"),
+):
+    """Run pipeline on all match directories under input_dir."""
+    import concurrent.futures
+
+    from wpv.db import get_record, init_db
+    from wpv.pipeline import run_pipeline
+
+    init_db()
+
+    match_dirs = sorted(
+        d for d in input_dir.iterdir()
+        if d.is_dir() and list(d.glob("*.mp4"))
+    )
+
+    if not match_dirs:
+        typer.echo(f"[batch] No match directories with .mp4 files found in {input_dir}")
+        raise typer.Exit(1)
+
+    if resume:
+        to_run = []
+        for d in match_dirs:
+            rec = get_record(d.name)
+            if rec and rec.status == "completed":
+                typer.echo(f"  [batch] Skipping {d.name} (completed)")
+                continue
+            to_run.append(d)
+        match_dirs = to_run
+
+    typer.echo(f"[batch] {len(match_dirs)} match(es) to process")
+
+    def _run_one(d: Path) -> tuple[str, bool, str | None]:
+        r = run_pipeline(d, skip_upload=skip_upload)
+        err = None
+        if not r.success:
+            failed = [s for s in r.stages if not s.success and not s.skipped]
+            err = failed[0].error if failed else "unknown error"
+        return r.match_id, r.success, err
+
+    if parallel > 1:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=parallel) as pool:
+            futures = {pool.submit(_run_one, d): d for d in match_dirs}
+            for fut in concurrent.futures.as_completed(futures):
+                match_id, ok, err = fut.result()
+                if ok:
+                    typer.echo(f"  [batch] {match_id} — completed")
+                else:
+                    typer.echo(f"  [batch] {match_id} — FAILED: {err}")
+    else:
+        for d in match_dirs:
+            match_id, ok, err = _run_one(d)
+            if ok:
+                typer.echo(f"  [batch] {match_id} — completed")
+            else:
+                typer.echo(f"  [batch] {match_id} — FAILED: {err}")
+
+    typer.echo("[batch] Done")
+
+
+@app.command()
+def upload(
+    video: Path = typer.Argument(..., help="Path to video file to upload"),
+    manifest_path: Path = typer.Option(..., "-m", "--manifest", help="Path to manifest.json"),
+    privacy: str = typer.Option(None, "--privacy", help="Privacy setting (unlisted, private, public)"),
+    title: str = typer.Option(None, "--title", help="Override video title"),
+):
+    """Upload a video to YouTube."""
+    from wpv.ingest.manifest import load_manifest
+    from wpv.publish.youtube import upload_from_manifest
+
+    m = load_manifest(manifest_path)
+    typer.echo(f"[upload] Uploading {video.name}...")
+    result = upload_from_manifest(video, m, privacy=privacy, title=title)
+    typer.echo(f"[upload] Done — {result.url}")
+
+
+@app.command()
+def ui(
+    port: int = typer.Option(5000, "--port", help="HTTP port for the web UI"),
+    host: str = typer.Option("0.0.0.0", "--host", help="Host to bind to"),
+):
+    """Launch the web UI for game setup and processing."""
+    from wpv.web.app import create_app
+
+    web_app = create_app()
+    typer.echo(f"[ui] Starting web UI on http://{host}:{port}")
+    web_app.run(host=host, port=port, threaded=True)
+
+
+@app.command()
+def status(
+    match: str = typer.Option(None, "--match", help="Show detail for a specific match ID"),
+):
+    """Show processing status of all matches."""
+    from wpv.db import get_all_records, get_record, init_db
+
+    init_db()
+
+    if match:
+        rec = get_record(match)
+        if rec is None:
+            typer.echo(f"[status] No record found for {match}")
+            raise typer.Exit(1)
+        typer.echo(f"Match:      {rec.match_id}")
+        typer.echo(f"Source:     {rec.source_path}")
+        typer.echo(f"Status:     {rec.status}")
+        typer.echo(f"Started:    {rec.started_at or '-'}")
+        typer.echo(f"Completed:  {rec.completed_at or '-'}")
+        typer.echo(f"Error:      {rec.error_message or '-'}")
+        typer.echo(f"Coverage:   {rec.track_coverage_pct or '-'}%")
+        typer.echo(f"Quality:    {'PASS' if rec.quality_passed else ('FAIL' if rec.quality_passed is not None else '-')}")
+        typer.echo(f"YouTube:    {rec.youtube_url or '-'}")
+        return
+
+    records = get_all_records()
+    if not records:
+        typer.echo("[status] No matches recorded yet")
+        return
+
+    # Table header
+    typer.echo(f"{'MATCH':<30} {'STATUS':<12} {'COVERAGE':<10} {'QUALITY':<8} {'YOUTUBE'}")
+    typer.echo("-" * 90)
+    for r in records:
+        cov = f"{r.track_coverage_pct:.1f}%" if r.track_coverage_pct is not None else "-"
+        qual = "PASS" if r.quality_passed else ("FAIL" if r.quality_passed is not None else "-")
+        yt = r.youtube_url or "-"
+        typer.echo(f"{r.match_id:<30} {r.status:<12} {cov:<10} {qual:<8} {yt}")
 
 
 if __name__ == "__main__":
