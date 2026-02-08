@@ -533,6 +533,67 @@ def train_classifier(
 
 
 # ---------------------------------------------------------------------------
+# Reference-image histogram scorer
+# ---------------------------------------------------------------------------
+
+
+class BallReferenceScorer:
+    """Score candidates by color similarity to a reference ball image.
+
+    Uses two complementary methods:
+    1. Back-projection: project the reference HS histogram onto the candidate
+       region to get a per-pixel "ball probability" map.  Mean of this map
+       over the blob gives a robust score even for tiny crops.
+    2. Hue distance: penalize candidates whose mean hue is far from the ball's.
+
+    No training data needed — just a picture of the ball.
+    """
+
+    def __init__(self, ref_image_path: str | Path):
+        ref = cv2.imread(str(ref_image_path))
+        if ref is None:
+            raise FileNotFoundError(f"Cannot read reference image: {ref_image_path}")
+        hsv = cv2.cvtColor(ref, cv2.COLOR_BGR2HSV)
+        # Mask out background (low saturation = white/gray)
+        mask = (hsv[:, :, 1] > 30).astype(np.uint8) * 255
+        ball_hsv = hsv[mask > 0]
+        # Store reference HSV stats
+        self._h_median = float(np.median(ball_hsv[:, 0]))
+        self._h_std = float(np.std(ball_hsv[:, 0])) + 1.0
+        # 2D HS histogram for back-projection
+        self._ref_hist = cv2.calcHist(
+            [hsv], [0, 1], mask, [30, 32], [0, 180, 0, 256]
+        )
+        cv2.normalize(self._ref_hist, self._ref_hist, 0, 255, cv2.NORM_MINMAX)
+
+    def score(
+        self, frame_bgr: np.ndarray, candidates: list[Candidate]
+    ) -> list[tuple[Candidate, float]]:
+        """Score each candidate by color similarity to reference ball."""
+        if not candidates:
+            return []
+        hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+        # Back-project reference histogram onto entire frame once
+        bp = cv2.calcBackProject([hsv], [0, 1], self._ref_hist, [0, 180, 0, 256], 1)
+        results: list[tuple[Candidate, float]] = []
+        for c in candidates:
+            x, y, w, h = c.bbox
+            # Mean back-projection value over the blob region
+            roi = bp[y : y + h, x : x + w]
+            bp_score = float(roi.mean()) / 255.0 if roi.size > 0 else 0.0
+            # Hue distance penalty (circular, wraps at 180)
+            h_diff = abs(c.mean_hsv[0] - self._h_median)
+            h_diff = min(h_diff, 180 - h_diff)
+            h_score = max(0.0, 1.0 - (h_diff / (3 * self._h_std)))
+            # Combined score, rescaled so that good ball candidates reach ~0.7-0.9
+            raw = bp_score * 0.6 + h_score * 0.4
+            # Stretch: 0.3 → 0.5, 0.4 → 0.8 (map the useful range to [0, 1])
+            score = max(0.0, min(1.0, (raw - 0.1) / 0.4))
+            results.append((c, score))
+        return results
+
+
+# ---------------------------------------------------------------------------
 # CNN classifier (passthrough until a model is trained)
 # ---------------------------------------------------------------------------
 
@@ -614,11 +675,18 @@ class BallClassifier:
 
 
 class BallDetector:
-    """Two-stage ball detector: HSV candidates → CNN verification."""
+    """Two-stage ball detector: HSV candidates → scoring.
+
+    Scoring priority:
+    1. CNN model (if model_path points to a trained .pth file)
+    2. Histogram scorer (if ref_image_path points to a ball reference image)
+    3. Passthrough (all candidates get confidence 0.5)
+    """
 
     def __init__(
         self,
         model_path: str | Path | None = None,
+        ref_image_path: str | Path | None = None,
         min_area: int = 4,
         max_area: int = 60,
         min_circularity: float = 0.5,
@@ -629,8 +697,16 @@ class BallDetector:
         self.min_circularity = min_circularity
         self.confidence_threshold = confidence_threshold
         self.classifier = BallClassifier(model_path)
+        self.hist_scorer: BallReferenceScorer | None = None
+        if ref_image_path and Path(ref_image_path).exists():
+            self.hist_scorer = BallReferenceScorer(ref_image_path)
 
-    def detect(self, frame_bgr: np.ndarray, pool_mask: np.ndarray | None = None) -> list[Detection]:
+    def detect(
+        self,
+        frame_bgr: np.ndarray,
+        pool_mask: np.ndarray | None = None,
+        hsv_bands: list[tuple[tuple[int, int, int], tuple[int, int, int]]] | None = None,
+    ) -> list[Detection]:
         """Run two-stage detection on a single frame."""
         candidates = detect_hsv_candidates(
             frame_bgr,
@@ -638,8 +714,15 @@ class BallDetector:
             max_area=self.max_area,
             min_circularity=self.min_circularity,
             pool_mask=pool_mask,
+            hsv_bands=hsv_bands,
         )
-        scored = self.classifier.predict(frame_bgr, candidates)
+        # Score: prefer CNN if trained, otherwise use histogram scorer
+        if self.classifier.model is not None:
+            scored = self.classifier.predict(frame_bgr, candidates)
+        elif self.hist_scorer is not None:
+            scored = self.hist_scorer.score(frame_bgr, candidates)
+        else:
+            scored = [(c, 0.5) for c in candidates]
         return [Detection(candidate=c, confidence=conf) for c, conf in scored]
 
     def process_video(

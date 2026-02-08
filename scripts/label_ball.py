@@ -191,9 +191,12 @@ def _make_game_area_mask(
 # ---------------------------------------------------------------------------
 
 
+BALL_REF_PATH = Path("data/ball_reference.webp")
+
+
 def cmd_prep(args: argparse.Namespace) -> None:
     """Extract frames from LRV files, run HSV detection, write prep.json."""
-    from wpv.tracking.detector import detect_hsv_candidates, detect_pool_mask
+    from wpv.tracking.detector import BallReferenceScorer, detect_hsv_candidates, detect_pool_mask
 
     # Safety check: don't clobber existing annotations
     if ANNOTATIONS_PATH.exists() and not args.force:
@@ -264,6 +267,14 @@ def cmd_prep(args: argparse.Namespace) -> None:
         "frames": [],
     }
 
+    # Reference scorer — score candidates by similarity to ball picture
+    ref_scorer = None
+    if BALL_REF_PATH.exists():
+        ref_scorer = BallReferenceScorer(BALL_REF_PATH)
+        print(f"Using ball reference image: {BALL_REF_PATH}")
+    else:
+        print("WARNING: No ball reference image found, candidates will be unscored")
+
     frame_list: list[dict] = []
     clip_idx = 0
     game_masks = _load_game_masks()
@@ -305,14 +316,22 @@ def cmd_prep(args: argparse.Namespace) -> None:
 
             # Run HSV detection (filtered to pool region)
             candidates = detect_hsv_candidates(frame, pool_mask=pool_mask, hsv_bands=hsv_bands)
+
+            # Score candidates by reference ball similarity
+            if ref_scorer and candidates:
+                scored = ref_scorer.score(frame, candidates)
+            else:
+                scored = [(c, 0.5) for c in candidates]
+
             candidates_data = []
-            for c in candidates:
+            for c, score in scored:
                 candidates_data.append({
                     "bbox": list(c.bbox),
                     "centroid": list(c.centroid),
                     "area": c.area,
                     "circularity": c.circularity,
                     "mean_hsv": list(c.mean_hsv),
+                    "ref_score": round(score, 3),
                 })
 
             frame_list.append({
@@ -341,8 +360,17 @@ def cmd_prep(args: argparse.Namespace) -> None:
     print(f"\nWrote {len(frame_list)} frames to {PREP_PATH}")
 
     total_candidates = sum(len(f["candidates"]) for f in frame_list)
-    print(f"Total HSV candidates: {total_candidates} "
+    high_conf = sum(
+        1 for f in frame_list for c in f["candidates"] if c.get("ref_score", 0) > 0.6
+    )
+    frames_with_ball = sum(
+        1 for f in frame_list
+        if any(c.get("ref_score", 0) > 0.6 for c in f["candidates"])
+    )
+    print(f"\nTotal HSV candidates: {total_candidates} "
           f"(avg {total_candidates / max(1, len(frame_list)):.1f}/frame)")
+    print(f"High-confidence candidates (score>0.6): {high_conf}")
+    print(f"Frames with likely ball: {frames_with_ball}/{len(frame_list)}")
 
 
 # ---------------------------------------------------------------------------
@@ -411,6 +439,8 @@ MASK_HTML_TEMPLATE = r"""<!DOCTYPE html>
 <div class="header">
   <h1>Game Area Mask — Clip {{ clip_idx }}</h1>
   <div style="display:flex; align-items:center; gap:12px;">
+    <a href="/masks" style="color:#0af;font-size:13px;text-decoration:none;">All Masks</a>
+    <a href="/label/0" style="color:#0af;font-size:13px;text-decoration:none;">Labeling</a>
     <div class="progress-bar"><div class="progress-fill" id="progress-fill" style="width:{{ progress_pct }}%"></div></div>
     <span class="progress-text" id="progress-text">{{ clip_num }}/{{ total_clips }} clips</span>
   </div>
@@ -423,10 +453,12 @@ MASK_HTML_TEMPLATE = r"""<!DOCTYPE html>
   </div>
 
   <div class="controls">
+    <button onclick="navClip(-1)" id="prev-clip"><kbd>&larr;</kbd> Prev Clip</button>
     <button onclick="undoPoint()"><kbd>Z</kbd> Undo Point</button>
     <button onclick="clearPoly()"><kbd>C</kbd> Clear</button>
     <button id="cone-btn" onclick="toggleCones()"><kbd>H</kbd> Highlight Cones</button>
     <button class="save-btn" onclick="saveMask()"><kbd>Enter</kbd> Save & Next</button>
+    <button onclick="navClip(1)" id="next-clip"><kbd>&rarr;</kbd> Next Clip</button>
   </div>
 
   <div class="info" id="info">{{ info_text }}</div>
@@ -439,6 +471,8 @@ const CLIP_IDX = {{ clip_idx }};
 const CLIP_NAME = '{{ clip_name }}';
 const EXISTING_POLY = {{ existing_poly_json | safe }};
 const CONE_CANDIDATES = {{ cone_candidates_json | safe }};
+const REVIEW_MODE = {{ review_mode }};
+const TOTAL_CLIPS = {{ total_clips }};
 const ZOOM_SIZE = 200;
 const ZOOM_FACTOR = 8;
 
@@ -660,7 +694,7 @@ function saveMask() {
   fetch('/api/save-mask', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({clip_name: CLIP_NAME, polygon: points})
+    body: JSON.stringify({clip_name: CLIP_NAME, polygon: points, review: REVIEW_MODE})
   }).then(r => r.json()).then(function(data) {
     if (data.ok) {
       showToast('Saved! Advancing...');
@@ -677,6 +711,13 @@ function saveMask() {
   });
 }
 
+function navClip(delta) {
+  let next = CLIP_IDX + delta;
+  if (next >= 0 && next < TOTAL_CLIPS) {
+    window.location.href = '/mask/' + next;
+  }
+}
+
 function showToast(msg) {
   let t = document.getElementById('toast');
   t.textContent = msg;
@@ -684,8 +725,14 @@ function showToast(msg) {
   setTimeout(function() { t.classList.remove('show'); }, 1500);
 }
 
+// Hide prev/next buttons at boundaries
+if (CLIP_IDX <= 0) document.getElementById('prev-clip').style.display = 'none';
+if (CLIP_IDX >= TOTAL_CLIPS - 1) document.getElementById('next-clip').style.display = 'none';
+
 // Keyboard shortcuts
 document.addEventListener('keydown', function(e) {
+  if (e.key === 'ArrowLeft') { navClip(-1); e.preventDefault(); return; }
+  if (e.key === 'ArrowRight') { navClip(1); e.preventDefault(); return; }
   if (e.key === 'z' || e.key === 'Z') { undoPoint(); e.preventDefault(); }
   else if (e.key === 'c' || e.key === 'C') { clearPoly(); e.preventDefault(); }
   else if (e.key === 'h' || e.key === 'H') { toggleCones(); e.preventDefault(); }
@@ -767,6 +814,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <div class="header">
   <h1>Ball Labeling</h1>
   <div style="display:flex; align-items:center; gap:12px;">
+    <a href="/masks" style="color:#0af;font-size:13px;text-decoration:none;">Review Masks</a>
     <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
     <span class="progress-text" id="progress-text">0/0</span>
   </div>
@@ -1903,6 +1951,8 @@ def _register_mask_routes(app, prep_data: dict) -> None:
                 f"{len(auto_poly)} auto-detected points. Click to adjust, Enter to save."
             )
         html = html.replace("{{ info_text }}", info)
+        # Review mode: mask already saved (user is editing, not creating for the first time)
+        html = html.replace("{{ review_mode }}", "true" if existing_poly else "false")
         return html
 
     @app.route("/api/mask-frame/<int:clip_idx>")
@@ -1937,9 +1987,18 @@ def _register_mask_routes(app, prep_data: dict) -> None:
         for k in stale:
             del cone_cache[k]
 
-        # Find next clip needing a mask
-        missing = _clips_needing_masks()
-        next_clip = missing[0] if missing else None
+        # Find next clip: if reviewing (came from /masks), advance sequentially;
+        # otherwise go to next missing mask
+        review_mode = data.get("review", False)
+        clip_idx = next(
+            (c["clip_idx"] for c in clips if f"clip_{c['clip_idx']:03d}" == clip_name),
+            None,
+        )
+        if review_mode and clip_idx is not None and clip_idx + 1 < len(clips):
+            next_clip = clip_idx + 1
+        else:
+            missing = _clips_needing_masks()
+            next_clip = missing[0] if missing else None
         return jsonify({"ok": True, "next_clip": next_clip})
 
     @app.route("/api/masks-status")
@@ -1950,6 +2009,41 @@ def _register_mask_routes(app, prep_data: dict) -> None:
             "missing": missing,
             "all_done": len(missing) == 0,
         })
+
+    @app.route("/masks")
+    def masks_overview():
+        """Overview page to review/edit all game area masks."""
+        game_masks = _load_game_masks()
+        rows = ""
+        for c in clips:
+            ci = c["clip_idx"]
+            cname = f"clip_{ci:03d}"
+            has_mask = cname in game_masks
+            status = "saved" if has_mask else "missing"
+            color = "#2a9d8f" if has_mask else "#e94560"
+            npts = len(game_masks[cname]) if has_mask else 0
+            rows += (
+                f'<tr><td><a href="/mask/{ci}" style="color:#0af">{cname}</a></td>'
+                f'<td style="color:{color}">{status}</td>'
+                f'<td>{npts} pts</td>'
+                f'<td>{c.get("file","")}</td></tr>\n'
+            )
+        return f"""<!doctype html><html><head>
+<meta charset="utf-8"><title>Game Area Masks</title>
+<style>
+body {{ background:#1a1a2e; color:#eee; font-family:system-ui; padding:20px; }}
+h1 {{ margin:0 0 16px; }}
+a {{ color:#0af; }}
+table {{ border-collapse:collapse; width:100%; }}
+th,td {{ text-align:left; padding:6px 12px; border-bottom:1px solid #333; }}
+th {{ color:#888; font-size:13px; }}
+.back {{ margin-bottom:16px; display:inline-block; }}
+</style></head><body>
+<a href="/" class="back">Back to Labeling</a>
+<h1>Game Area Masks ({len(game_masks)}/{len(clips)} clips)</h1>
+<p style="color:#888;font-size:13px;">Click a clip name to review/edit its mask.</p>
+<table><tr><th>Clip</th><th>Status</th><th>Points</th><th>File</th></tr>
+{rows}</table></body></html>"""
 
 
 def cmd_batch(args: argparse.Namespace) -> None:
