@@ -16,10 +16,8 @@ COPY pyproject.toml .
 COPY src/ src/
 RUN pip install --no-cache-dir .
 
-# Insta360 Media SDK — place manually in vendor/insta360/ before build
-COPY vendor/insta360/ /opt/insta360/
-ENV PATH="/opt/insta360:${PATH}"
-
 RUN mkdir -p /data/raw /data/work /data/output
 
-ENTRYPOINT ["wpv"]
+EXPOSE 5000
+
+CMD ["wpv", "ui", "--host", "0.0.0.0", "--port", "5000"]

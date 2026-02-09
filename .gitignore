@@ -22,6 +22,11 @@ env/
 data/
 data/labeling/
 vendor/
+matches/
+results.db
+
+# Secrets
+client_secrets.json
 src/wpv/tracking/models/*.pt
 src/wpv/tracking/models/*.pth
 src/wpv/tracking/models/*.onnx

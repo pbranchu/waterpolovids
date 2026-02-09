@@ -1,13 +1,23 @@
 services:
   wpv:
     build: .
+    restart: unless-stopped
     runtime: nvidia
+    ports:
+      - "5050:5000"
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
+      - WPV_RAW_ROOT=/data/work
+      - WPV_GAME_MASKS_PATH=/data/raw/labeling/game_masks.json
+      - WPV_RESULTS_DB_PATH=/app/project/results.db
+      - WPV_SHARED_OUTPUT_DIR=/data/shared
+      - WPV_YOUTUBE_CLIENT_SECRETS=/secrets/client_secrets.json
     volumes:
+      - /mnt/work/gitperso/waterpolovids:/app/project
+      - /mnt/work/shared:/data/shared
       - /mnt/work/shared/Waterpolo:/data/raw:ro
-      - wpv-work:/data/work
-      - wpv-output:/data/output
+      - /home/dev/.wpv:/secrets:ro
+    working_dir: /app/project
     deploy:
       resources:
         reservations:
@@ -15,7 +25,3 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
-
-volumes:
-  wpv-work:
-  wpv-output:

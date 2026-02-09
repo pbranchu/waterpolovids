@@ -1,0 +1,11 @@
+data/
+matches/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.git/
+vendor/
+client_secrets.json
+docs/
+tests/
