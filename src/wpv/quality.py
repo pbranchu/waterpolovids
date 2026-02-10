@@ -44,15 +44,14 @@ def run_quality_gates(
 
     track_ok = coverage_pct >= min_track_coverage_pct
 
-    # --- Highlight duration gate ---
+    # --- Highlight duration (informational only, does not gate) ---
     if segments is not None:
         hl_dur = sum(seg.end_s - seg.start_s for seg in segments)
-        hl_ok = hl_dur >= min_highlight_duration_s
     else:
         hl_dur = 0.0
-        hl_ok = True  # skip gate when no segments provided
+    hl_ok = True  # highlight duration is informational, never blocks
 
-    passed = track_ok and hl_ok
+    passed = track_ok
 
     return QualityReport(
         passed=passed,

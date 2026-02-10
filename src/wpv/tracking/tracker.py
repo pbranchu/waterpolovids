@@ -158,6 +158,7 @@ class BallTracker:
         )
 
         t0 = time.monotonic()
+        self._last_progress_t = 0.0
         kalman = BallKalmanFilter(fps=reader.fps)
         state = TrackState.INIT
         consecutive_misses = 0
@@ -222,8 +223,11 @@ class BallTracker:
             except StopIteration:
                 break
 
-            if progress_callback and frame_idx % 100 == 0:
-                progress_callback(frame_idx, reader.frame_count, state.value)
+            if progress_callback:
+                now = time.monotonic()
+                if now - self._last_progress_t >= 2.0:
+                    progress_callback(frame_idx, reader.frame_count, state.value)
+                    self._last_progress_t = now
 
             state_counts[state.value] += 1
 
@@ -276,6 +280,7 @@ class BallTracker:
                         resume = self._handle_search(
                             reader, kalman, result, loss_frame, loss_x, loss_y,
                             det_pool_mask, hsv_bands, state_counts,
+                            progress_callback,
                         )
                         if resume is not None:
                             state = TrackState.TRACKING
@@ -295,6 +300,7 @@ class BallTracker:
             if state == TrackState.ACTION_PROXY:
                 break
 
+        reader.close()
         result.elapsed_s = time.monotonic() - t0
         result.stats = {
             "state_distribution": state_counts,
@@ -319,101 +325,40 @@ class BallTracker:
         det_pool_mask: np.ndarray | None,
         hsv_bands,
         state_counts: dict[str, int],
+        progress_callback: Callable[[int, int, str], None] | None = None,
     ) -> int | None:
-        """SEARCH_FORWARD -> REWIND_BACKWARD -> GAP_BRIDGE.
+        """SEARCH_FORWARD -> GAP_BRIDGE.
+
+        Uses forward scanning instead of random seeks — on H.265, sequential
+        decode is ~50x faster than seek (8.6fps vs 6.9s per seek).
 
         Returns the frame index to resume TRACKING from, or None for ACTION_PROXY.
         """
         fps = reader.fps
-        step_frames = int(self._search_step_s * fps)
         max_gap_frames = int(self._search_max_gap_s * fps)
-        sample_count = 10
+        # Check every N frames during scan (1 second intervals)
+        scan_interval = max(1, int(fps))
+        end_frame = min(loss_frame + max_gap_frames, reader.frame_count)
 
-        # SEARCH_FORWARD
-        search_frame = loss_frame + step_frames
-        reacquire_frame: int | None = None
+        consecutive = 0
+        last_pos: tuple[float, float] | None = None
+        found_frame: int | None = None
+        found_x, found_y = loss_x, loss_y
 
-        while search_frame < min(loss_frame + max_gap_frames, reader.frame_count):
+        for frame_idx, frame_bgr in reader.sequential_frames(start=loss_frame + 1, end=end_frame):
             state_counts[TrackState.SEARCH_FORWARD.value] += 1
 
-            sample_indices = [
-                min(search_frame + i * int(fps * 0.2), reader.frame_count - 1)
-                for i in range(sample_count)
-            ]
-            sample_indices = sorted(set(i for i in sample_indices if i < reader.frame_count))
-
-            frames = reader.seek_frames(sample_indices)
-
-            consecutive = 0
-            last_pos: tuple[float, float] | None = None
-            found_frame: int | None = None
-
-            for idx in sorted(frames.keys()):
-                bgr = frames[idx]
-                if self._scale != 1.0:
-                    h = int(bgr.shape[0] * self._scale)
-                    w = int(bgr.shape[1] * self._scale)
-                    small = cv2.resize(bgr, (w, h))
-                else:
-                    small = bgr
-
-                dets = self._detector.detect(small, pool_mask=det_pool_mask, hsv_bands=hsv_bands)
-                above = [d for d in dets if d.confidence >= self._confidence_threshold]
-
-                if above:
-                    best = max(above, key=lambda d: d.confidence)
-                    cx, cy = best.candidate.centroid
-                    pos = (cx / self._scale, cy / self._scale)
-
-                    if last_pos is not None:
-                        dt_frames = max(1, idx - (found_frame or idx))
-                        dt_s = dt_frames / fps
-                        dist = np.sqrt(
-                            (pos[0] - last_pos[0]) ** 2 + (pos[1] - last_pos[1]) ** 2
-                        )
-                        if dist / max(dt_s, 0.001) > 2000:
-                            consecutive = 0
-                            last_pos = None
-                            found_frame = None
-                            continue
-
-                    consecutive += 1
-                    last_pos = pos
-                    if found_frame is None:
-                        found_frame = idx
-
-                    if consecutive >= self._reacquire_persistence:
-                        reacquire_frame = found_frame
-                        break
-                else:
-                    consecutive = 0
-                    last_pos = None
-                    found_frame = None
-
-            if reacquire_frame is not None:
-                break
-            search_frame += step_frames
-
-        if reacquire_frame is None:
-            return None
-
-        # REWIND_BACKWARD: binary search for exact reappearance
-        state_counts[TrackState.REWIND_BACKWARD.value] += 1
-        rewind_step = int(self._rewind_step_s * fps)
-        lo = loss_frame
-        hi = reacquire_frame
-
-        while hi - lo > rewind_step:
-            mid = (lo + hi) // 2
-            frame_bgr = reader.seek_frame(mid)
-            if frame_bgr is None:
-                hi = mid
+            # Only run detection every scan_interval frames
+            if (frame_idx - loss_frame) % scan_interval != 0:
                 continue
 
+            if progress_callback:
+                progress_callback(frame_idx, reader.frame_count, TrackState.SEARCH_FORWARD.value)
+
             if self._scale != 1.0:
-                h_s = int(frame_bgr.shape[0] * self._scale)
-                w_s = int(frame_bgr.shape[1] * self._scale)
-                small = cv2.resize(frame_bgr, (w_s, h_s))
+                h = int(frame_bgr.shape[0] * self._scale)
+                w = int(frame_bgr.shape[1] * self._scale)
+                small = cv2.resize(frame_bgr, (w, h))
             else:
                 small = frame_bgr
 
@@ -421,51 +366,60 @@ class BallTracker:
             above = [d for d in dets if d.confidence >= self._confidence_threshold]
 
             if above:
-                hi = mid
-            else:
-                lo = mid
-
-        point2_frame = hi
-        point2_x, point2_y = loss_x, loss_y
-
-        point2_bgr = reader.seek_frame(point2_frame)
-        if point2_bgr is not None:
-            if self._scale != 1.0:
-                h_s = int(point2_bgr.shape[0] * self._scale)
-                w_s = int(point2_bgr.shape[1] * self._scale)
-                small = cv2.resize(point2_bgr, (w_s, h_s))
-            else:
-                small = point2_bgr
-
-            dets = self._detector.detect(small, pool_mask=det_pool_mask, hsv_bands=hsv_bands)
-            above = [d for d in dets if d.confidence >= self._confidence_threshold]
-            if above:
                 best = max(above, key=lambda d: d.confidence)
                 cx, cy = best.candidate.centroid
-                point2_x, point2_y = cx / self._scale, cy / self._scale
+                pos = (cx / self._scale, cy / self._scale)
 
-        # GAP_BRIDGE: smoothstep interpolation
+                if last_pos is not None:
+                    dt_frames = max(1, frame_idx - (found_frame or frame_idx))
+                    dt_s = dt_frames / fps
+                    dist = np.sqrt(
+                        (pos[0] - last_pos[0]) ** 2 + (pos[1] - last_pos[1]) ** 2
+                    )
+                    if dist / max(dt_s, 0.001) > 2000:
+                        consecutive = 0
+                        last_pos = None
+                        found_frame = None
+                        continue
+
+                consecutive += 1
+                last_pos = pos
+                if found_frame is None:
+                    found_frame = frame_idx
+                    found_x, found_y = pos
+
+                if consecutive >= self._reacquire_persistence:
+                    break
+            else:
+                consecutive = 0
+                last_pos = None
+                found_frame = None
+
+        if found_frame is None or consecutive < self._reacquire_persistence:
+            return None
+
+        # GAP_BRIDGE: smoothstep interpolation from loss to reacquire
         state_counts[TrackState.GAP_BRIDGE.value] += 1
-        gap_len = point2_frame - loss_frame
+        gap_len = found_frame - loss_frame
         if gap_len > 0:
-            for f in range(loss_frame + 1, point2_frame):
+            for f in range(loss_frame + 1, found_frame):
                 t = (f - loss_frame) / gap_len
                 s = _smoothstep(t)
-                ix = loss_x + s * (point2_x - loss_x)
-                iy = loss_y + s * (point2_y - loss_y)
+                ix = loss_x + s * (found_x - loss_x)
+                iy = loss_y + s * (found_y - loss_y)
                 result.points.append(
                     TrackPoint(f, ix, iy, 0.3, TrackState.GAP_BRIDGE.value)
                 )
 
-        result.gaps.append(TrackGap(loss_frame, point2_frame, "bridged"))
+        result.gaps.append(TrackGap(loss_frame, found_frame, "bridged"))
 
-        # Re-init Kalman at point2
-        kalman.init_state(point2_x, point2_y)
+        # Re-init Kalman at reacquire point
+        kalman.init_state(found_x, found_y)
         result.points.append(
-            TrackPoint(point2_frame, point2_x, point2_y, 0.5, TrackState.TRACKING.value)
+            TrackPoint(found_frame, found_x, found_y, 0.5, TrackState.TRACKING.value)
         )
 
-        return point2_frame
+        return found_frame
 
     def _fill_action_proxy(
         self,
@@ -489,8 +443,11 @@ class BallTracker:
         x, y = hold_x, hold_y
 
         for frame_idx, frame_bgr in reader.sequential_frames(start=start_frame):
-            if progress_callback and frame_idx % 100 == 0:
-                progress_callback(frame_idx, reader.frame_count, TrackState.ACTION_PROXY.value)
+            if progress_callback:
+                now = time.monotonic()
+                if now - self._last_progress_t >= 2.0:
+                    progress_callback(frame_idx, reader.frame_count, TrackState.ACTION_PROXY.value)
+                    self._last_progress_t = now
 
             state_counts[TrackState.ACTION_PROXY.value] += 1
 
@@ -520,8 +477,11 @@ class BallTracker:
 
                 # Continue tracking remaining frames sequentially
                 for frame_idx2, frame_bgr2 in reader.sequential_frames(start=frame_idx + 1):
-                    if progress_callback and frame_idx2 % 100 == 0:
-                        progress_callback(frame_idx2, reader.frame_count, TrackState.TRACKING.value)
+                    if progress_callback:
+                        now = time.monotonic()
+                        if now - self._last_progress_t >= 2.0:
+                            progress_callback(frame_idx2, reader.frame_count, TrackState.TRACKING.value)
+                            self._last_progress_t = now
                     state_counts[TrackState.TRACKING.value] += 1
                     kalman.predict()
 

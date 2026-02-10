@@ -51,20 +51,32 @@
 
 {% block scripts %}
 <script>
-// Load playlist suggestions
+// Load playlist suggestions (YouTube + pending from queue)
 fetch('/api/playlists')
   .then(function(r) { return r.json(); })
   .then(function(data) {
-    if (data.ok && data.playlists.length > 0) {
-      var el = document.getElementById('playlist-suggestions');
-      var html = '<div class="playlist-list"><span class="text-muted">Existing:</span> ';
-      data.playlists.forEach(function(p) {
+    if (!data.ok || data.playlists.length === 0) return;
+    var el = document.getElementById('playlist-suggestions');
+    var yt = data.playlists.filter(function(p) { return p.source === 'youtube'; });
+    var pending = data.playlists.filter(function(p) { return p.source === 'pending'; });
+    var html = '<div class="playlist-list">';
+    if (yt.length > 0) {
+      html += '<span class="text-muted">YouTube:</span> ';
+      yt.forEach(function(p) {
         html += '<button type="button" class="btn btn-sm" onclick="document.getElementById(\'playlist_name\').value=\'' +
                 p.title.replace(/'/g, "\\'") + '\'">' + p.title + '</button> ';
       });
-      html += '</div>';
-      el.innerHTML = html;
     }
+    if (pending.length > 0) {
+      if (yt.length > 0) html += '<br>';
+      html += '<span class="text-muted">Pending:</span> ';
+      pending.forEach(function(p) {
+        html += '<button type="button" class="btn btn-sm" onclick="document.getElementById(\'playlist_name\').value=\'' +
+                p.title.replace(/'/g, "\\'") + '\'">' + p.title + '</button> ';
+      });
+    }
+    html += '</div>';
+    el.innerHTML = html;
   })
   .catch(function() {});
 </script>

@@ -291,6 +291,18 @@ def update_game_field(
         conn.close()
 
 
+def delete_game(game_id: str, db_path: Path | None = None) -> None:
+    """Delete a game and its clips."""
+    init_db(db_path)
+    conn = _connect(db_path)
+    try:
+        conn.execute("DELETE FROM game_clips WHERE game_id = ?", (game_id,))
+        conn.execute("DELETE FROM games WHERE game_id = ?", (game_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def add_game_clip(clip: GameClipRecord, db_path: Path | None = None) -> None:
     """Insert or replace a game clip record."""
     init_db(db_path)

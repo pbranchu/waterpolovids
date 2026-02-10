@@ -26,7 +26,7 @@
       <td>
         <span class="badge badge-{{ g.status }}">{{ g.status }}</span>
         {% if g.error_message and g.status == 'failed' %}
-        <span class="error-hint" title="{{ g.error_message }}">!</span>
+        <div class="error-message">{{ g.error_message }}</div>
         {% endif %}
       </td>
       <td>
@@ -34,6 +34,7 @@
           <div class="progress-fill-sm" style="width:{{ g.progress_pct }}%"></div>
         </div>
         <span class="progress-pct">{{ "%.0f"|format(g.progress_pct) }}%</span>
+        <div class="progress-msg text-muted"></div>
       </td>
       <td class="actions">
         {% if g.status == 'setup' %}
@@ -41,11 +42,16 @@
         <a href="/game/{{ g.game_id }}/masks" class="btn btn-sm">Masks</a>
         <a href="/game/{{ g.game_id }}/review" class="btn btn-sm btn-accent">Review</a>
         {% elif g.status in ('processing', 'queued') %}
-        <span class="text-muted">Processing...</span>
+        <button type="button" class="btn btn-sm btn-danger" onclick="cancelGame('{{ g.game_id }}', '{{ g.name }}')">Cancel</button>
         {% elif g.status == 'completed' %}
         <span class="text-success">Done</span>
         {% elif g.status == 'failed' %}
         <a href="/game/{{ g.game_id }}/review" class="btn btn-sm">Retry</a>
+        {% elif g.status == 'cancelled' %}
+        <a href="/game/{{ g.game_id }}/review" class="btn btn-sm">Retry</a>
+        {% endif %}
+        {% if g.status not in ('processing', 'queued') %}
+        <button type="button" class="btn btn-sm btn-danger" onclick="deleteGame('{{ g.game_id }}', '{{ g.name }}')">Delete</button>
         {% endif %}
       </td>
     </tr>
@@ -62,4 +68,26 @@
 
 {% block scripts %}
 <script src="{{ url_for('static', filename='dashboard.js') }}"></script>
+<script>
+function deleteGame(gameId, name) {
+  if (!confirm('Delete "' + name + '"? This cannot be undone.')) return;
+  fetch('/api/game/' + gameId, { method: 'DELETE' })
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      if (data.ok) location.reload();
+      else alert(data.error || 'Delete failed');
+    })
+    .catch(function(err) { alert('Error: ' + err.message); });
+}
+function cancelGame(gameId, name) {
+  if (!confirm('Cancel processing for "' + name + '"?')) return;
+  fetch('/api/game/' + gameId + '/cancel', { method: 'POST' })
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      if (data.ok) location.reload();
+      else alert(data.error || 'Cancel failed');
+    })
+    .catch(function(err) { alert('Error: ' + err.message); });
+}
+</script>
 {% endblock %}

@@ -42,6 +42,7 @@ class PipelineResult:
     stages: list[StageResult] = field(default_factory=list)
     success: bool = False
     youtube_url: str | None = None
+    youtube_urls: list[str] = field(default_factory=list)
 
 
 def run_pipeline(
@@ -97,7 +98,10 @@ def run_pipeline(
             progress_callback(stage, "starting")
 
         try:
-            sr = stage_funcs[stage](match_dir, work_dir, match_id, db_path)
+            if stage == Stage.TRACK and progress_callback:
+                sr = stage_funcs[stage](match_dir, work_dir, match_id, db_path, progress_callback)
+            else:
+                sr = stage_funcs[stage](match_dir, work_dir, match_id, db_path)
         except Exception as e:
             sr = StageResult(stage=stage, success=False, error=str(e))
 
@@ -117,10 +121,15 @@ def run_pipeline(
     update_field(match_id, "completed_at", _now(), db_path)
     result.success = True
 
-    # Grab youtube URL if uploaded
+    # Grab youtube URLs if uploaded
     rec = get_record(match_id, db_path)
     if rec and rec.youtube_url:
         result.youtube_url = rec.youtube_url
+        # youtube_url is stored as JSON array of URLs
+        try:
+            result.youtube_urls = json.loads(rec.youtube_url)
+        except (json.JSONDecodeError, TypeError):
+            result.youtube_urls = [rec.youtube_url]
 
     return result
 
@@ -149,7 +158,7 @@ def _stage_decode(match_dir: Path, work_dir: Path, match_id: str, db_path) -> St
     from wpv.ingest.detect_format import detect_format
     from wpv.ingest.stitch import prepare_equirect
 
-    existing = list(work_dir.glob("*.mp4"))
+    existing = [p for p in work_dir.glob("*.mp4") if "_render" not in p.stem and p.stem != "output"]
     if existing:
         return StageResult(stage=Stage.DECODE, success=True, skipped=True,
                            output_path=existing[0])
@@ -166,45 +175,150 @@ def _stage_decode(match_dir: Path, work_dir: Path, match_id: str, db_path) -> St
     return StageResult(stage=Stage.DECODE, success=True, output_path=last_out)
 
 
-def _stage_track(match_dir: Path, work_dir: Path, match_id: str, db_path) -> StageResult:
-    """Track ball in each work/*.mp4 clip. Skips clips whose .json exists."""
+def _stage_track(match_dir: Path, work_dir: Path, match_id: str, db_path, progress_callback=None) -> StageResult:
+    """Track ball in each work/*.mp4 clip, in parallel.
+
+    Each clip gets its own tracker thread.  A shared BallDetector (thread-safe
+    for inference) avoids redundant model loading.  Clips whose .json already
+    exists are skipped.
+    """
+    import threading
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     from wpv.tracking.detector import BallDetector
-    from wpv.tracking.track_io import save_track
+    from wpv.tracking.track_io import load_track, save_track
     from wpv.tracking.tracker import BallTracker
 
-    work_videos = sorted(work_dir.glob("*.mp4"))
+    work_videos = sorted(p for p in work_dir.glob("*.mp4") if "_render" not in p.stem and p.stem != "output")
     if not work_videos:
         return StageResult(stage=Stage.TRACK, success=False, error="No decoded videos in work/")
 
+    # Fail fast if model or reference image is missing
+    missing = []
+    if not settings.ball_model_path.exists():
+        missing.append(f"CNN model not found: {settings.ball_model_path}")
+    if not settings.ball_ref_image_path.exists():
+        missing.append(f"Reference image not found: {settings.ball_ref_image_path}")
+    if missing:
+        return StageResult(stage=Stage.TRACK, success=False, error="; ".join(missing))
+
+    # Shared detector — the CNN model and histogram scorer are read-only
+    # during inference, so safe to share across threads.
     detector = BallDetector(
+        model_path=settings.ball_model_path,
+        ref_image_path=settings.ball_ref_image_path,
         min_area=settings.min_ball_px,
         max_area=settings.max_ball_px,
         confidence_threshold=settings.detection_confidence_threshold,
     )
-    tracker = BallTracker(
-        detector=detector,
-        detection_scale=settings.track_detection_scale,
-        loss_frames=settings.track_loss_frames,
-        search_step_s=settings.search_forward_step_s,
-        search_max_gap_s=settings.search_max_gap_s,
-        rewind_step_s=settings.rewind_coarse_step_s,
-        reacquire_persistence=settings.track_reacquire_persistence,
-        gate_distance=settings.track_gate_distance,
-        confidence_threshold=settings.detection_confidence_threshold,
-    )
 
-    last_track_path = None
-    for vp in work_videos:
+    num_clips = len(work_videos)
+    # Per-clip progress state, guarded by a lock.
+    # Skipped clips (JSON exists) are pre-filled as 100%.
+    clip_state: dict[int, tuple[int, int, str]] = {}
+    skipped: set[int] = set()
+    state_lock = threading.Lock()
+
+    # Pre-scan for already-completed clips
+    for ci, vp in enumerate(work_videos):
+        if (work_dir / f"{vp.stem}.json").exists():
+            skipped.add(ci)
+            clip_state[ci] = (1, 1, "done")
+
+    def _report_aggregate():
+        """Build an aggregate progress message from all clips."""
+        if not progress_callback:
+            return
+        with state_lock:
+            if not clip_state:
+                return
+            total_pct = 0.0
+            parts = []
+            for ci in range(num_clips):
+                if ci in skipped:
+                    total_pct += 100.0
+                    continue
+                if ci not in clip_state:
+                    continue
+                fi, ft, sn = clip_state[ci]
+                pct = fi / ft * 100 if ft > 0 else 0
+                total_pct += pct
+                parts.append(f"c{ci+1}:{sn[:4]}")
+            overall = total_pct / num_clips
+        active = " ".join(parts) if parts else "waiting"
+        progress_callback(Stage.TRACK, f"{num_clips} clips ({overall:.0f}%) [{active}]")
+
+    def _track_one(clip_idx: int, vp: Path):
         track_json = work_dir / f"{vp.stem}.json"
         if track_json.exists():
-            last_track_path = track_json
-            continue
-        result = tracker.track_clip(vp, clip_name=vp.stem)
+            return clip_idx, load_track(track_json), track_json
+
+        # Each thread gets its own BallTracker (has mutable per-track state)
+        tracker = BallTracker(
+            detector=detector,
+            detection_scale=settings.track_detection_scale,
+            loss_frames=settings.track_loss_frames,
+            search_step_s=settings.search_forward_step_s,
+            search_max_gap_s=settings.search_max_gap_s,
+            rewind_step_s=settings.rewind_coarse_step_s,
+            reacquire_persistence=settings.track_reacquire_persistence,
+            gate_distance=settings.track_gate_distance,
+            confidence_threshold=settings.detection_confidence_threshold,
+        )
+
+        def _clip_progress(frame_idx, frame_total, state_name):
+            with state_lock:
+                clip_state[clip_idx] = (frame_idx, frame_total, state_name)
+            _report_aggregate()
+
+        result = tracker.track_clip(
+            vp, clip_name=vp.stem,
+            progress_callback=_clip_progress if progress_callback else None,
+        )
         save_track(result, track_json)
+        return clip_idx, result, track_json
+
+    max_workers = min(num_clips, settings.track_parallel_clips)
+    results: dict[int, tuple] = {}
+    errors: list[str] = []
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {
+            pool.submit(_track_one, ci, vp): ci
+            for ci, vp in enumerate(work_videos)
+        }
+        for future in as_completed(futures):
+            ci = futures[future]
+            try:
+                clip_idx, result, track_json = future.result()
+                results[clip_idx] = (result, track_json)
+            except Exception as exc:
+                errors.append(f"Clip {ci} ({work_videos[ci].name}): {exc}")
+
+    if errors:
+        return StageResult(stage=Stage.TRACK, success=False, error="; ".join(errors))
+
+    # Aggregate results
+    total_frames = 0
+    tracking_frames = 0
+    last_track_path = None
+    for ci in sorted(results):
+        result, track_json = results[ci]
+        total_frames += result.frame_count
+        tracking_frames += sum(1 for pt in result.points if pt.state == "tracking")
         last_track_path = track_json
 
     if last_track_path:
         update_field(match_id, "track_path", str(last_track_path), db_path)
+
+    # Fail early if ball was never detected — don't waste time rendering
+    if total_frames > 0:
+        coverage = tracking_frames / total_frames * 100
+        if coverage < settings.quality_min_track_coverage_pct:
+            return StageResult(
+                stage=Stage.TRACK, success=False,
+                error=f"Ball tracking coverage too low: {coverage:.1f}% "
+                      f"(need {settings.quality_min_track_coverage_pct}%)")
 
     return StageResult(stage=Stage.TRACK, success=True, output_path=last_track_path)
 
@@ -287,8 +401,10 @@ def _stage_render(match_dir: Path, work_dir: Path, match_id: str, db_path) -> St
         render_parts.append(render_mp4)
 
     # Concatenate all rendered parts into output.mp4
+    # Keep individual renders for per-clip upload
     if len(render_parts) == 1:
-        render_parts[0].rename(output_mp4)
+        import shutil as _shutil
+        _shutil.copy2(render_parts[0], output_mp4)
     else:
         concat_list = work_dir / "concat.txt"
         concat_list.write_text(
@@ -312,8 +428,16 @@ def _stage_render(match_dir: Path, work_dir: Path, match_id: str, db_path) -> St
 
 
 def _stage_highlights(match_dir: Path, work_dir: Path, match_id: str, db_path) -> StageResult:
-    """Extract highlights. Skips if work/highlights.mp4 exists."""
+    """Extract highlights from ALL clips, build a single highlight reel.
+
+    Skips if work/highlights.mp4 exists.  Scores every track JSON,
+    offsets timestamps to the concatenated output.mp4 timeline, selects
+    the best segments across the full game, and builds one montage.
+    """
+    import subprocess as _sp
+
     from wpv.render.highlights import (
+        HighlightSegment,
         build_montage,
         save_segments,
         score_track,
@@ -327,44 +451,95 @@ def _stage_highlights(match_dir: Path, work_dir: Path, match_id: str, db_path) -
         return StageResult(stage=Stage.HIGHLIGHTS, success=True, skipped=True,
                            output_path=highlights_mp4)
 
-    # Need a rendered output + track
     output_mp4 = work_dir / "output.mp4"
     if not output_mp4.exists():
         return StageResult(stage=Stage.HIGHLIGHTS, success=False,
                            error="Rendered output.mp4 not found")
 
-    track_jsons = sorted(work_dir.glob("*.json"))
-    track_jsons = [t for t in track_jsons if t.name not in ("segments.json",)]
+    # Find track JSONs (those with a matching source .mp4 in work/)
+    track_jsons = sorted(
+        t for t in work_dir.glob("*.json")
+        if (work_dir / f"{t.stem}.mp4").exists()
+    )
     if not track_jsons:
         return StageResult(stage=Stage.HIGHLIGHTS, success=False, error="No track JSONs found")
 
-    track = load_track(track_jsons[0])
-    scores = score_track(
-        track,
-        speed_sigma_threshold=settings.highlight_speed_sigma,
-        direction_window_s=settings.highlight_direction_window_s,
-        gap_reappear_bonus=settings.highlight_gap_reappear_bonus,
-    )
-    segments = select_segments(
-        scores,
-        fps=track.fps,
-        threshold=settings.highlight_score_threshold,
-        context_s=settings.highlight_context_s,
-        min_segment_s=settings.highlight_min_duration_s,
-        target_duration_s=settings.highlight_target_duration_s,
-        max_segments=settings.highlight_max_segments,
-    )
+    # Score every clip and offset segments to the concatenated timeline
+    all_segments: list[HighlightSegment] = []
+    time_offset = 0.0
+    last_fps = 25.0
+
+    for track_path in track_jsons:
+        track = load_track(track_path)
+        last_fps = track.fps
+        clip_duration = track.frame_count / track.fps if track.fps > 0 else 0.0
+
+        scores = score_track(
+            track,
+            speed_sigma_threshold=settings.highlight_speed_sigma,
+            direction_window_s=settings.highlight_direction_window_s,
+            gap_reappear_bonus=settings.highlight_gap_reappear_bonus,
+        )
+        segments = select_segments(
+            scores,
+            fps=track.fps,
+            threshold=settings.highlight_score_threshold,
+            context_s=settings.highlight_context_s,
+            min_segment_s=settings.highlight_min_duration_s,
+            target_duration_s=settings.highlight_target_duration_s,
+            max_segments=settings.highlight_max_segments,
+        )
+
+        # Offset segments to concatenated-video timeline
+        for seg in segments:
+            all_segments.append(HighlightSegment(
+                start_frame=seg.start_frame + int(time_offset * track.fps),
+                end_frame=seg.end_frame + int(time_offset * track.fps),
+                start_s=seg.start_s + time_offset,
+                end_s=seg.end_s + time_offset,
+                peak_score=seg.peak_score,
+                mean_score=seg.mean_score,
+            ))
+
+        # Use actual render duration for offset (more accurate than track frames)
+        render_mp4 = work_dir / f"{track_path.stem}_render.mp4"
+        if render_mp4.exists():
+            try:
+                probe = _sp.run(
+                    ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+                     "-of", "csv=p=0", str(render_mp4)],
+                    capture_output=True, text=True, check=True,
+                )
+                time_offset += float(probe.stdout.strip())
+            except Exception:
+                time_offset += clip_duration
+        else:
+            time_offset += clip_duration
+
+    # Re-rank all segments across clips by peak score, trim to target
+    all_segments.sort(key=lambda s: s.peak_score, reverse=True)
+    selected: list[HighlightSegment] = []
+    total_dur = 0.0
+    for seg in all_segments:
+        if len(selected) >= settings.highlight_max_segments:
+            break
+        dur = seg.end_s - seg.start_s
+        if total_dur + dur > settings.highlight_target_duration_s and selected:
+            continue
+        selected.append(seg)
+        total_dur += dur
+    selected.sort(key=lambda s: s.start_s)
 
     segments_json = work_dir / "segments.json"
-    save_segments(segments, segments_json)
+    save_segments(selected, segments_json)
     update_field(match_id, "segments_path", str(segments_json), db_path)
 
-    if segments:
+    if selected:
         build_montage(
-            segments,
+            selected,
             source_video=output_mp4,
             output_path=highlights_mp4,
-            fps=track.fps,
+            fps=last_fps,
             crossfade_s=settings.highlight_crossfade_s,
             codec=settings.crop_output_codec,
             crf=settings.crop_output_crf,
@@ -382,8 +557,10 @@ def _stage_quality_check(match_dir: Path, work_dir: Path, match_id: str, db_path
     from wpv.render.highlights import load_segments
     from wpv.tracking.track_io import load_track
 
-    track_jsons = sorted(work_dir.glob("*.json"))
-    track_jsons = [t for t in track_jsons if t.name not in ("segments.json",)]
+    track_jsons = sorted(
+        t for t in work_dir.glob("*.json")
+        if (work_dir / f"{t.stem}.mp4").exists()
+    )
     if not track_jsons:
         return StageResult(stage=Stage.QUALITY_CHECK, success=False,
                            error="No track JSONs found")
@@ -406,26 +583,43 @@ def _stage_quality_check(match_dir: Path, work_dir: Path, match_id: str, db_path
     update_field(match_id, "quality_passed", report.passed, db_path)
 
     if not report.passed:
+        reasons = []
+        if not report.track_coverage_ok:
+            reasons.append(f"coverage {report.track_coverage_pct}% < {settings.quality_min_track_coverage_pct}%")
+        if not report.highlight_duration_ok:
+            reasons.append(f"highlights {report.highlight_duration_s}s < {settings.quality_min_highlight_duration_s}s")
         return StageResult(stage=Stage.QUALITY_CHECK, success=False,
-                           error=f"Quality gates failed: coverage={report.track_coverage_pct}%")
+                           error=f"Quality gates failed: {'; '.join(reasons)}")
 
     return StageResult(stage=Stage.QUALITY_CHECK, success=True)
 
 
 def _stage_upload(match_dir: Path, work_dir: Path, match_id: str, db_path) -> StageResult:
-    """Upload to YouTube. Skips if DB already has youtube_video_id."""
+    """Upload per-clip renders + highlight reel to YouTube.
+
+    For a game with N clips, uploads:
+    - N individual clip renders (``{stem}_render.mp4``)
+    - 1 highlight reel (``highlights.mp4``) named "{title} - Highlights"
+
+    Single-clip title = game name.  Multi-clip titles = "{name} - Part N".
+    Skips if DB already has youtube_video_id.
+    """
     rec = get_record(match_id, db_path)
     if rec and rec.youtube_video_id:
         return StageResult(stage=Stage.UPLOAD, success=True, skipped=True)
 
-    # Find the video to upload (highlights preferred, fallback to full render)
-    highlights_mp4 = work_dir / "highlights.mp4"
-    output_mp4 = work_dir / "output.mp4"
-    video_to_upload = highlights_mp4 if highlights_mp4.exists() else output_mp4
+    # Discover individual renders
+    render_mp4s = sorted(work_dir.glob("*_render.mp4"))
+    if not render_mp4s:
+        # Fall back to output.mp4 if no individual renders
+        output_mp4 = work_dir / "output.mp4"
+        if output_mp4.exists():
+            render_mp4s = [output_mp4]
+        else:
+            return StageResult(stage=Stage.UPLOAD, success=False,
+                               error="No video files to upload")
 
-    if not video_to_upload.exists():
-        return StageResult(stage=Stage.UPLOAD, success=False,
-                           error="No video file to upload")
+    highlights_mp4 = work_dir / "highlights.mp4"
 
     # Load or generate manifest
     manifest_path = match_dir / "manifest.json"
@@ -437,11 +631,41 @@ def _stage_upload(match_dir: Path, work_dir: Path, match_id: str, db_path) -> St
         manifest = generate_manifest(match_dir)
         manifest_path.write_text(manifest.model_dump_json(indent=2))
 
-    from wpv.publish.youtube import upload_from_manifest
+    from wpv.publish.youtube import (
+        build_metadata_from_manifest,
+        get_authenticated_service,
+        upload_video,
+    )
 
-    upload_result = upload_from_manifest(video_to_upload, manifest)
-    update_field(match_id, "youtube_video_id", upload_result.video_id, db_path)
-    update_field(match_id, "youtube_url", upload_result.url, db_path)
+    service = get_authenticated_service()
+    base_title = manifest.teams
+    num_clips = len(render_mp4s)
+    all_video_ids: list[str] = []
+    all_urls: list[str] = []
+
+    # Upload each clip render
+    for i, rmp4 in enumerate(render_mp4s):
+        if num_clips == 1:
+            title = base_title
+        else:
+            title = f"{base_title} - Part {i + 1}"
+
+        meta = build_metadata_from_manifest(manifest, title_override=title)
+        result = upload_video(service, rmp4, meta)
+        all_video_ids.append(result.video_id)
+        all_urls.append(result.url)
+
+    # Upload highlights reel
+    if highlights_mp4.exists():
+        hl_title = f"{base_title} - Highlights"
+        meta = build_metadata_from_manifest(manifest, title_override=hl_title)
+        result = upload_video(service, highlights_mp4, meta)
+        all_video_ids.append(result.video_id)
+        all_urls.append(result.url)
+
+    # Store first video ID for skip-check; store all URLs as JSON
+    update_field(match_id, "youtube_video_id", all_video_ids[0], db_path)
+    update_field(match_id, "youtube_url", json.dumps(all_urls), db_path)
     update_field(match_id, "uploaded_at", _now(), db_path)
 
     return StageResult(stage=Stage.UPLOAD, success=True)

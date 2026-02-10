@@ -106,7 +106,8 @@ class BallKalmanFilter:
         y_innov = z - predicted
 
         # Mahalanobis: sqrt(y^T * S^-1 * y)
-        S_inv = np.linalg.inv(S)
+        # Use pseudo-inverse to handle near-singular covariance matrices
+        S_inv = np.linalg.pinv(S)
         d2 = float((y_innov.T @ S_inv @ y_innov)[0, 0])
         return float(np.sqrt(max(d2, 0.0)))
 

@@ -20,22 +20,71 @@ log = logging.getLogger(__name__)
 
 
 class TaskManager:
-    """Simple background task manager with a single worker thread."""
+    """Background task manager with parallel game workers.
+
+    Multiple worker threads pull games from a shared queue, so several
+    games can be processed concurrently (e.g. one rendering while another
+    tracks).  The number of workers is controlled by settings.parallel_games.
+    """
 
     def __init__(self) -> None:
         self._queue: queue.Queue[str] = queue.Queue()
         self._progress: dict[str, dict] = {}
-        self._thread: threading.Thread | None = None
+        self._workers: list[threading.Thread] = []
         self._lock = threading.Lock()
+        self._cancelled: set[str] = set()
 
-    def _ensure_worker(self) -> None:
-        if self._thread is None or not self._thread.is_alive():
-            self._thread = threading.Thread(target=self._worker, daemon=True)
-            self._thread.start()
+    def recover_on_startup(self) -> None:
+        """Re-enqueue games stuck as queued/processing from a previous run."""
+        from wpv.db import get_all_games
+        for game in get_all_games():
+            if game.status in ("queued", "processing"):
+                log.info("Recovering stuck game %s (was %s)", game.game_id, game.status)
+                self._queue.put(game.game_id)
+                with self._lock:
+                    self._progress[game.game_id] = {
+                        "status": "queued",
+                        "stage": None,
+                        "progress_pct": 0,
+                        "message": "Re-queued after restart",
+                    }
+                update_game_field(game.game_id, "status", "queued")
+        if not self._queue.empty():
+            self._ensure_workers()
+
+    def _ensure_workers(self) -> None:
+        """Start worker threads up to parallel_games, replacing any dead ones."""
+        # Clean out dead threads
+        self._workers = [t for t in self._workers if t.is_alive()]
+
+        # Re-enqueue orphaned games if all workers died and queue is empty
+        if not self._workers and self._queue.empty():
+            from wpv.db import get_all_games
+            for game in get_all_games():
+                if game.status in ("queued", "processing"):
+                    already_queued = False
+                    with self._lock:
+                        already_queued = game.game_id in self._progress and \
+                            self._progress[game.game_id].get("status") in ("queued", "processing")
+                    if not already_queued:
+                        log.info("Re-enqueuing orphaned game %s", game.game_id)
+                        self._queue.put(game.game_id)
+                        with self._lock:
+                            self._progress[game.game_id] = {
+                                "status": "queued", "stage": None,
+                                "progress_pct": 0, "message": "Re-queued (worker restart)",
+                            }
+
+        target = settings.parallel_games
+        while len(self._workers) < target:
+            t = threading.Thread(target=self._worker, daemon=True)
+            t.start()
+            self._workers.append(t)
 
     def enqueue(self, game_id: str) -> None:
         """Add a game to the processing queue."""
         with self._lock:
+            self._cancelled.discard(game_id)
             self._progress[game_id] = {
                 "status": "queued",
                 "stage": None,
@@ -44,10 +93,33 @@ class TaskManager:
             }
         update_game_field(game_id, "status", "queued")
         self._queue.put(game_id)
-        self._ensure_worker()
+        self._ensure_workers()
+
+    def cancel(self, game_id: str) -> bool:
+        """Cancel a queued or processing game. Returns True if it was active."""
+        with self._lock:
+            was_active = game_id in self._progress and self._progress[game_id].get("status") in ("queued", "processing")
+            self._cancelled.add(game_id)
+            self._progress[game_id] = {
+                "status": "cancelled",
+                "stage": None,
+                "progress_pct": 0,
+                "message": "Cancelled by user",
+            }
+        update_game_field(game_id, "status", "cancelled")
+        return was_active
+
+    def is_cancelled(self, game_id: str) -> bool:
+        """Check if a game has been cancelled."""
+        with self._lock:
+            return game_id in self._cancelled
 
     def get_progress(self, game_id: str) -> dict:
         """Get current progress for a game."""
+        # Restart workers if they all died
+        alive = any(t.is_alive() for t in self._workers)
+        if not alive:
+            self._ensure_workers()
         with self._lock:
             if game_id in self._progress:
                 return self._progress[game_id].copy()
@@ -71,10 +143,15 @@ class TaskManager:
     def _worker(self) -> None:
         while True:
             try:
-                game_id = self._queue.get(timeout=1)
+                game_id = self._queue.get(timeout=5)
             except queue.Empty:
+                # Exit if queue has been empty for a while (will be restarted if needed)
                 continue
             try:
+                # Skip if cancelled while queued
+                if self.is_cancelled(game_id):
+                    log.info("Skipping cancelled game %s", game_id)
+                    continue
                 self._process_game(game_id)
             except Exception:
                 log.exception("Error processing game %s", game_id)
@@ -86,6 +163,9 @@ class TaskManager:
                 update_game_field(game_id, "error_message", tb[-1000:])
             finally:
                 self._queue.task_done()
+                # Clean up cancel flag
+                with self._lock:
+                    self._cancelled.discard(game_id)
 
     def _process_game(self, game_id: str) -> None:
         from wpv.pipeline import Stage, run_pipeline
@@ -166,11 +246,28 @@ class TaskManager:
         total_weight = sum(stage_weights.values())
         completed_weight = 0
 
+        import re
+        import time as _time
+        _last_db_write = [0.0]
+
         def _progress(stage: Stage, msg: str) -> None:
             nonlocal completed_weight
+            # Check for cancellation between stages
+            if self.is_cancelled(game_id):
+                raise _CancelledError(game_id)
+
             if msg == "done" or msg == "skipped":
                 completed_weight += stage_weights.get(stage, 0)
-            pct = min(99, completed_weight * 100 / total_weight)
+            # For intra-stage messages containing a percentage, interpolate
+            intra_pct = 0.0
+            if msg not in ("starting", "done", "skipped") and not msg.startswith("failed"):
+                m = re.search(r'\((\d+)%\)', msg)
+                if m:
+                    intra_pct = int(m.group(1)) / 100.0
+            base_pct = completed_weight * 100 / total_weight
+            stage_pct = stage_weights.get(stage, 0) * intra_pct * 100 / total_weight
+            pct = min(99, base_pct + stage_pct)
+            # Always update in-memory (cheap, serves API instantly)
             self._update_progress(
                 game_id,
                 status="processing",
@@ -178,14 +275,26 @@ class TaskManager:
                 progress_pct=pct,
                 message=f"{stage.value}: {msg}",
             )
-            update_game_field(game_id, "current_stage", stage.value)
-            update_game_field(game_id, "progress_pct", pct)
+            # Throttle DB writes to at most once per 5 seconds
+            now = _time.monotonic()
+            if now - _last_db_write[0] >= 5 or msg in ("starting", "done", "skipped") or msg.startswith("failed"):
+                update_game_field(game_id, "current_stage", stage.value)
+                update_game_field(game_id, "progress_pct", pct)
+                _last_db_write[0] = now
 
-        result = run_pipeline(
-            game_dir,
-            skip_upload=not game.playlist_name,
-            progress_callback=_progress,
-        )
+        try:
+            result = run_pipeline(
+                game_dir,
+                skip_upload=not game.playlist_name,
+                progress_callback=_progress,
+            )
+        except _CancelledError:
+            log.info("Game %s cancelled during processing", game_id)
+            self._update_progress(
+                game_id, status="cancelled", message="Cancelled by user",
+            )
+            update_game_field(game_id, "status", "cancelled")
+            return
 
         if result.success:
             self._update_progress(
@@ -195,8 +304,8 @@ class TaskManager:
             update_game_field(game_id, "status", "completed")
             update_game_field(game_id, "progress_pct", 100)
 
-            # Handle playlist if configured
-            if game.playlist_name and result.youtube_url:
+            # Handle playlist if configured — add ALL uploaded videos
+            if game.playlist_name and result.youtube_urls:
                 try:
                     from wpv.publish.youtube import (
                         add_video_to_playlist,
@@ -206,9 +315,9 @@ class TaskManager:
                     service = get_authenticated_service()
                     pid = get_or_create_playlist(service, game.playlist_name)
                     update_game_field(game_id, "playlist_id", pid)
-                    # Extract video ID from URL
-                    vid_id = result.youtube_url.split("/")[-1]
-                    add_video_to_playlist(service, pid, vid_id)
+                    for url in result.youtube_urls:
+                        vid_id = url.split("/")[-1]
+                        add_video_to_playlist(service, pid, vid_id)
                 except Exception:
                     log.exception("Failed to add to playlist for game %s", game_id)
         else:
@@ -219,6 +328,11 @@ class TaskManager:
             )
             update_game_field(game_id, "status", "failed")
             update_game_field(game_id, "error_message", err)
+
+
+class _CancelledError(Exception):
+    """Raised inside progress callback when a game is cancelled."""
+    pass
 
 
 # Module-level singleton

@@ -24,12 +24,17 @@
           if (pct) {
             pct.textContent = Math.round(data.progress_pct || 0) + '%';
           }
+          // Update progress message
+          var msgEl = row.querySelector('.progress-msg');
+          if (msgEl && data.message) {
+            msgEl.textContent = data.message;
+          }
           // Update row status attribute
           if (data.status) {
             row.setAttribute('data-status', data.status);
           }
-          // If completed or failed, refresh after a beat to update action buttons
-          if (data.status === 'completed' || data.status === 'failed') {
+          // If completed, failed, or cancelled, refresh to update action buttons
+          if (data.status === 'completed' || data.status === 'failed' || data.status === 'cancelled') {
             setTimeout(function() { location.reload(); }, 1500);
           }
         })

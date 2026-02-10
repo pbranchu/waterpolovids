@@ -3,20 +3,28 @@ services:
     build: .
     restart: unless-stopped
     runtime: nvidia
-    ports:
-      - "5050:5000"
+    network_mode: host
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
+      - WPV_WEB_PORT=5050
+      - PYTHONPATH=/app/project/src
+      - WPV_INSTA360_SDK_PATH=/opt/insta360
+      - LD_LIBRARY_PATH=/opt/insta360/lib
       - WPV_RAW_ROOT=/data/work
+      - WPV_BALL_MODEL_PATH=/data/raw/labeling/models/ball_classifier.pth
+      - WPV_BALL_REF_IMAGE_PATH=/data/raw/ball_reference.webp
       - WPV_GAME_MASKS_PATH=/data/raw/labeling/game_masks.json
       - WPV_RESULTS_DB_PATH=/app/project/results.db
       - WPV_SHARED_OUTPUT_DIR=/data/shared
       - WPV_YOUTUBE_CLIENT_SECRETS=/secrets/client_secrets.json
+      - WPV_YOUTUBE_TOKEN_PATH=/secrets/youtube_token.json
     volumes:
       - /mnt/work/gitperso/waterpolovids:/app/project
       - /mnt/work/shared:/data/shared
       - /mnt/work/shared/Waterpolo:/data/raw:ro
-      - /home/dev/.wpv:/secrets:ro
+      - /mnt/work/shared/Waterpolo/wpv_work:/data/work
+      - /home/dev/.wpv:/secrets
+      - /opt/insta360:/opt/insta360:ro
     working_dir: /app/project
     deploy:
       resources:

@@ -89,9 +89,9 @@ def build_fisheye_to_perspective_maps(
         ])
 
     # Build rotation matrix: columns are right, down, forward
-    up_hint = np.array([0.0, 0.0, 1.0])
+    up_hint = np.array([0.0, -1.0, 0.0])
     if abs(np.dot(forward, up_hint)) > 0.999:
-        up_hint = np.array([0.0, 1.0, 0.0])
+        up_hint = np.array([0.0, 0.0, 1.0])
 
     right = np.cross(forward, up_hint)
     right /= np.linalg.norm(right)
@@ -757,12 +757,13 @@ class FFmpegWriter:
         if self._source_path is not None:
             cmd += ["-i", self._source_path]
             cmd += ["-map", "0:v", "-map", "1:a?"]
-        cmd += [
-            "-c:v", self._codec,
-            "-crf", str(self._crf),
-            "-preset", self._preset,
-            "-pix_fmt", "yuv420p",
-        ]
+        is_nvenc = "nvenc" in self._codec
+        cmd += ["-c:v", self._codec]
+        if is_nvenc:
+            cmd += ["-qp", str(self._crf), "-preset", self._preset]
+        else:
+            cmd += ["-crf", str(self._crf), "-preset", self._preset]
+        cmd += ["-pix_fmt", "yuv420p"]
         if self._source_path is not None:
             cmd += ["-c:a", "copy"]
         cmd += ["-movflags", "+faststart", self._output_path]
@@ -905,13 +906,18 @@ class CropRenderer:
         y_expr = _build_crop_expr(ys, max_y, keyframe_step=25)
         vf = f"crop={self.crop_w}:{self.crop_h}:{x_expr}:{y_expr}"
 
+        is_nvenc = "nvenc" in self.codec
         cmd = [
             "ffmpeg", "-y",
             "-i", str(self.video_path),
             "-vf", vf,
             "-c:v", self.codec,
-            "-crf", str(self.crf),
-            "-preset", self.preset,
+        ]
+        if is_nvenc:
+            cmd += ["-qp", str(self.crf), "-preset", self.preset]
+        else:
+            cmd += ["-crf", str(self.crf), "-preset", self.preset]
+        cmd += [
             "-pix_fmt", "yuv420p",
             "-c:a", "aac",
             "-movflags", "+faststart",

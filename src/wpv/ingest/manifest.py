@@ -14,9 +14,9 @@ from wpv.ingest.detect_format import VideoFormat, detect_format
 
 
 class MatchManifest(BaseModel):
-    match_id: str
-    date: str
-    time: str
+    match_id: str = ""
+    date: str = ""
+    time: str = ""
     teams: str = "unknown"
     location: str = "unknown"
     clips: list[ClipInfo] = Field(default_factory=list)
@@ -24,15 +24,15 @@ class MatchManifest(BaseModel):
 
 class ClipInfo(BaseModel):
     filename: str
-    sequence: int
-    clip_id: int
-    format: str
-    width: int
-    height: int
-    fps: float
-    duration: float
-    codec: str
-    has_lrv: bool
+    sequence: int = 0
+    clip_id: int = 0
+    format: str = "single_lens"
+    width: int = 0
+    height: int = 0
+    fps: float = 0.0
+    duration: float = 0.0
+    codec: str = "unknown"
+    has_lrv: bool = False
     lrv_filename: str | None = None
 
 

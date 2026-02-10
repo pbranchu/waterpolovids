@@ -68,6 +68,8 @@ body {
 .btn-primary:hover { background: #1a4a80; }
 .btn-accent { background: #2a9d8f; border-color: #2a9d8f; }
 .btn-accent:hover { background: #238b7e; }
+.btn-danger { background: #6b2020; border-color: #6b2020; }
+.btn-danger:hover { background: #8b2a2a; }
 .btn-save { background: #2a9d8f; border-color: #2a9d8f; }
 .btn-save:hover { background: #238b7e; }
 .btn-sm { padding: 4px 10px; font-size: 13px; }
@@ -107,16 +109,15 @@ body {
 .badge-completed { background: #0a4a2a; color: #4d8; }
 .badge-failed { background: #4a1a1a; color: #f66; }
 
-.error-hint {
-  display: inline-block;
-  width: 18px; height: 18px;
-  text-align: center; line-height: 18px;
-  background: #a33;
-  border-radius: 50%;
+.error-message {
+  margin-top: 6px;
+  padding: 6px 10px;
+  background: #4a1a1a;
+  border-left: 3px solid #f66;
+  border-radius: 3px;
   font-size: 12px;
-  font-weight: 700;
-  cursor: help;
-  margin-left: 4px;
+  color: #f99;
+  word-break: break-word;
 }
 
 /* Progress bars */

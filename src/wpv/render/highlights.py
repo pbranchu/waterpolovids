@@ -319,13 +319,17 @@ def _copy_single(
     src: Path, dst: Path, codec: str, crf: int, preset: str,
 ) -> None:
     """Re-encode a single segment to the output (ensures consistent encoding)."""
+    is_nvenc = "nvenc" in codec
     cmd = [
         "ffmpeg", "-y",
         "-i", str(src),
         "-c:v", codec,
-        "-crf", str(crf),
-        "-preset", preset,
-        "-pix_fmt", "yuv420p",
+    ]
+    if is_nvenc:
+        cmd += ["-qp", str(crf), "-preset", preset]
+    else:
+        cmd += ["-crf", str(crf), "-preset", preset]
+    cmd += ["-pix_fmt", "yuv420p",
         "-c:a", "aac",
         "-movflags", "+faststart",
         str(dst),
@@ -380,13 +384,18 @@ def _concat_with_xfade(
         a_prev = a_out
 
     filter_complex = ";".join(v_filters + a_filters)
+    is_nvenc = "nvenc" in codec
     cmd = ["ffmpeg", "-y"] + inputs + [
         "-filter_complex", filter_complex,
         "-map", "[vout]",
         "-map", "[aout]",
         "-c:v", codec,
-        "-crf", str(crf),
-        "-preset", preset,
+    ]
+    if is_nvenc:
+        cmd += ["-qp", str(crf), "-preset", preset]
+    else:
+        cmd += ["-crf", str(crf), "-preset", preset]
+    cmd += [
         "-pix_fmt", "yuv420p",
         "-c:a", "aac",
         "-movflags", "+faststart",
@@ -428,12 +437,17 @@ def _concat_video_only(
             offset += durations[i] - crossfade_s
 
     filter_complex = ";".join(v_filters)
+    is_nvenc = "nvenc" in codec
     cmd = ["ffmpeg", "-y"] + inputs + [
         "-filter_complex", filter_complex,
         "-map", "[vout]",
         "-c:v", codec,
-        "-crf", str(crf),
-        "-preset", preset,
+    ]
+    if is_nvenc:
+        cmd += ["-qp", str(crf), "-preset", preset]
+    else:
+        cmd += ["-crf", str(crf), "-preset", preset]
+    cmd += [
         "-pix_fmt", "yuv420p",
         "-an",
         "-movflags", "+faststart",

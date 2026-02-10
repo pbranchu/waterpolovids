@@ -589,12 +589,15 @@ def upload(
 
 @app.command()
 def ui(
-    port: int = typer.Option(5000, "--port", help="HTTP port for the web UI"),
+    port: int = typer.Option(None, "--port", help="HTTP port for the web UI"),
     host: str = typer.Option("0.0.0.0", "--host", help="Host to bind to"),
 ):
     """Launch the web UI for game setup and processing."""
+    from wpv.config import settings
     from wpv.web.app import create_app
 
+    if port is None:
+        port = settings.web_port
     web_app = create_app()
     typer.echo(f"[ui] Starting web UI on http://{host}:{port}")
     web_app.run(host=host, port=port, threaded=True)

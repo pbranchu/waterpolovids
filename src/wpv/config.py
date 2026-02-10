@@ -18,6 +18,10 @@ class Settings(BaseSettings):
     # Stitch / decode
     insta360_sdk_path: Path = Path("/opt/insta360")
 
+    # Ball detection models
+    ball_model_path: Path = Path("data/labeling/models/ball_classifier.pth")
+    ball_ref_image_path: Path = Path("data/ball_reference.webp")
+
     # Ball tracking
     hsv_yellow_low: tuple[int, int, int] = (20, 100, 100)
     hsv_yellow_high: tuple[int, int, int] = (35, 255, 255)
@@ -34,6 +38,8 @@ class Settings(BaseSettings):
     search_forward_step_s: float = 5.0
     search_max_gap_s: float = 45.0
     rewind_coarse_step_s: float = 0.25
+    track_parallel_clips: int = 4
+    parallel_games: int = 2
 
     # Virtual camera
     max_angular_velocity_deg_s: float = 120.0
@@ -50,9 +56,9 @@ class Settings(BaseSettings):
     # Render (single-lens crop/pan)
     crop_output_width: int = 1280
     crop_output_height: int = 720
-    crop_output_codec: str = "libx264"
+    crop_output_codec: str = "hevc_nvenc"
     crop_output_crf: int = 20
-    crop_output_preset: str = "medium"
+    crop_output_preset: str = "p4"
     crop_smoothing_alpha: float = 0.08
     crop_dead_zone_px: int = 20
     crop_max_velocity_px: float = 120.0
@@ -77,7 +83,7 @@ class Settings(BaseSettings):
 
     # Quality gates
     quality_min_track_coverage_pct: float = 60.0
-    quality_min_highlight_duration_s: float = 180.0
+    quality_min_highlight_duration_s: float = 10.0
 
     # YouTube
     youtube_client_secrets: Path = Path("client_secrets.json")

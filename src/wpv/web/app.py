@@ -15,6 +15,7 @@ from wpv.db import (
     GameRecord,
     add_game_clip,
     create_game,
+    delete_game,
     get_all_games,
     get_clip_mask,
     get_game,
@@ -35,6 +36,10 @@ def create_app() -> Flask:
     app.jinja_env.globals["config"] = settings
 
     init_db()
+
+    # Recover games stuck as queued/processing from previous container run
+    from wpv.web.tasks import task_manager
+    task_manager.recover_on_startup()
 
     # -- Pages ---------------------------------------------------------------
 
@@ -263,20 +268,60 @@ def create_app() -> Flask:
         from wpv.web.tasks import task_manager
         return jsonify(task_manager.get_progress(game_id))
 
+    @app.route("/api/debug/worker")
+    def api_debug_worker():
+        from wpv.web.tasks import task_manager
+        return jsonify({
+            "workers_alive": sum(1 for t in task_manager._workers if t.is_alive()),
+            "workers_total": len(task_manager._workers),
+            "queue_size": task_manager._queue.qsize(),
+            "progress": {k: v for k, v in task_manager._progress.items()},
+        })
+
+    @app.route("/api/game/<game_id>/cancel", methods=["POST"])
+    def api_cancel_game(game_id):
+        from wpv.web.tasks import task_manager
+        was_active = task_manager.cancel(game_id)
+        return jsonify({"ok": True, "was_active": was_active})
+
+    @app.route("/api/game/<game_id>", methods=["DELETE"])
+    def api_delete_game(game_id):
+        game = get_game(game_id)
+        if not game:
+            return jsonify({"ok": False, "error": "Game not found"}), 404
+        if game.status in ("processing", "queued"):
+            return jsonify({"ok": False, "error": "Cannot delete while processing"}), 409
+        delete_game(game_id)
+        return jsonify({"ok": True})
+
     @app.route("/api/playlists")
     def api_playlists():
+        # Collect playlist names already used/pending in the DB
+        db_names = set()
+        for g in get_all_games():
+            if g.playlist_name:
+                db_names.add(g.playlist_name)
+
+        yt_playlists = []
+        yt_titles = set()
         try:
             from wpv.publish.youtube import get_authenticated_service
             service = get_authenticated_service()
             response = service.playlists().list(
                 part="snippet", mine=True, maxResults=50,
             ).execute()
-            playlists = [
-                {"id": item["id"], "title": item["snippet"]["title"]}
-                for item in response.get("items", [])
-            ]
-            return jsonify({"ok": True, "playlists": playlists})
-        except Exception as e:
-            return jsonify({"ok": False, "playlists": [], "error": str(e)})
+            for item in response.get("items", []):
+                title = item["snippet"]["title"]
+                yt_playlists.append({"id": item["id"], "title": title, "source": "youtube"})
+                yt_titles.add(title)
+        except Exception:
+            pass
+
+        # Add pending playlists (in DB but not yet on YouTube)
+        pending = [
+            {"title": name, "source": "pending"}
+            for name in sorted(db_names - yt_titles)
+        ]
+        return jsonify({"ok": True, "playlists": yt_playlists + pending})
 
     return app
